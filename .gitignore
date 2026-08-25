@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Inno Setup output
+Output/
+*.exe
+
+# 개인 데이터 (직접 추출한 단어장 등은 보통 공유 안 함)
+*.json
