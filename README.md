@@ -35,8 +35,8 @@ javascript:(function(){try{let sets=[];document.querySelectorAll('.flip-card').f
 ### 2. 프로그램 실행
 
 ```bash
-python main.py (일반사용자는 X)
-```
+python main.py 
+``` (일반사용자는 X)
 
 `📋 클립보드 불러오기` 버튼을 누르기 전에, 클래스카드 단어장 페이지에서 위 북마크릿을 먼저 클릭해 단어를 클립보드에 복사해두세요.
 
