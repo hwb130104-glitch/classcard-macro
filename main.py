@@ -343,7 +343,7 @@ def stop_macro(event=None):
 
 # --- UI 구성 ---
 root = tk.Tk()
-root.title('Classcard Master Bot')
+root.title('클래스카드 매크로')
 root.geometry('480x290')
 root.resizable(True, True)
 root.wm_attributes('-topmost', True)
