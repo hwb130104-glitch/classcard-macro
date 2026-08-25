@@ -18,8 +18,8 @@ Python(Tkinter) GUI + Selenium(브라우저 자동화) + PyAutoGUI(키/마우스
 - Google Chrome (리콜 모드는 Selenium으로 Chrome을 직접 띄웁니다)
 - 아래 패키지 설치:
 
-```bash
-pip install -r requirements.txt (일반사용자는 X)
+```bash (일반사용자는 X)
+pip install -r requirements.txt 
 ```
 
 ## 사용법
