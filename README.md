@@ -17,13 +17,14 @@ Python(Tkinter) GUI + Selenium(브라우저 자동화) + PyAutoGUI(키/마우스
 
 ## 요구사항
 
-- Python 3.x
+- Python 3.x (일반사용자는 X)
 - Google Chrome (리콜 모드는 Selenium으로 Chrome을 직접 띄웁니다)
 - 아래 패키지 설치:
 
-```bash
-pip install -r requirements.txt
+```bash 
+pip install -r requirements.txt 
 ```
+(일반사용자는 X)
 
 ## 사용법
 
@@ -38,8 +39,8 @@ javascript:(function(){try{let sets=[];document.querySelectorAll('.flip-card').f
 ### 2. 프로그램 실행
 
 ```bash
-python main.py
-```
+python main.py 
+``` (일반사용자는 X)
 
 `클립보드 불러오기` 버튼을 누르기 전에, 클래스카드 단어장 페이지에서 위 북마크릿을 먼저 클릭해 단어를 클립보드에 복사해두세요.
 
@@ -80,7 +81,7 @@ python main.py
    pyinstaller --onefile --windowed --name "암기" main.py
    ```
    빌드 결과물(`dist/암기.exe`)을 `setup.iss`와 같은 폴더로 복사합니다.
-2. [Inno Setup](https://jrsoftware.org/isinfo.php)으로 `setup.iss`를 열어 컴파일하면 `Classcard_Setup.exe` 설치 프로그램이 만들어집니다.
+2. [Inno Setup](https://jrsoftware.org/isinfo.php)으로 `setup.iss`를 열어 컴파일하면 `Classcard_Setup.exe` 설치 프로그램이 만들어집니다. (일반사용자는 X)
 
 ## 주의사항
 
