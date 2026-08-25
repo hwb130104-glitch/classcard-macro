@@ -73,7 +73,7 @@ def set_target_position():
 
   target_click_pos = pyautogui.position()
   lbl_status.config(
-      text=f'암기 매크로 대기 중 ({len(word_list)}개)\n[▶ 암기 시작]을 누르세요.',
+      text=f'암기 매크로 대기 중 ({len(word_list)}개)\n[암기 시작]을 누르세요.',
       fg='#388E3C',
   )
   btn_start.config(state=tk.NORMAL)
@@ -111,7 +111,7 @@ def run_macro_loop():
 
   if is_running:
     root.after(
-        0, lambda: lbl_status.config(text='🎉 암기 학습 완료!', fg='#388E3C')
+        0, lambda: lbl_status.config(text='암기 학습 완료!', fg='#388E3C')
     )
     stop_macro()
 
@@ -124,7 +124,7 @@ def start_macro():
 
   is_running = True
   lbl_status.config(
-      text='🚀 암기 자동 학습 진행 중... ([■ 정지] 버튼 클릭 시 중단)',
+      text='암기 자동 학습 진행 중... ([정지] 버튼 클릭 시 중단)',
       fg='#388E3C',
   )
   btn_load.config(state=tk.DISABLED)
@@ -140,7 +140,7 @@ def start_macro():
 # --- 리콜 학습 자동 풀이 스레드 ---
 def run_recall_selenium():
   if not word_list:
-    messagebox.showwarning('알림', '먼저 [📋 불러오기]로 단어를 로드해주세요.')
+    messagebox.showwarning('알림', '먼저 [불러오기]로 단어를 로드해주세요.')
     return
 
   t = threading.Thread(target=selenium_worker, daemon=True)
@@ -204,7 +204,7 @@ def selenium_worker():
   root.after(
       0,
       lambda: lbl_status.config(
-          text='🌐 크롬 실행 중... 로그인 후 리콜 학습에 들어가세요',
+          text='크롬 실행 중... 로그인 후 리콜 학습에 들어가세요',
           fg='#1976D2',
       ),
   )
@@ -227,7 +227,7 @@ def selenium_worker():
     root.after(
         0,
         lambda: lbl_status.config(
-            text='👀 리콜 학습 화면 감지 대기 중...', fg='#2E7D32'
+            text='리콜 학습 화면 감지 대기 중...', fg='#2E7D32'
         ),
     )
 
@@ -258,7 +258,7 @@ def selenium_worker():
 
       if current_word and is_running:
         target_kor = current_word['kor'].strip()
-        msg = f"🔍 단어 감지: [{current_word['eng']}] -> 정답 뜻: '{target_kor}'"
+        msg = f"단어 감지: [{current_word['eng']}] -> 정답 뜻: '{target_kor}'"
         root.after(0, lambda m=msg: lbl_status.config(text=m, fg='#0288D1'))
 
         time.sleep(0.5)  # 카드 전환 애니메이션 시작 대기
@@ -302,7 +302,7 @@ def selenium_worker():
           root.after(
               0,
               lambda t=target_kor: lbl_status.config(
-                  text=f'✨ 정답 [{t}] 선택 성공! 다음 문제 이동',
+                  text=f'정답 [{t}] 선택 성공! 다음 문제 이동',
                   fg='#388E3C',
               ),
           )
@@ -311,7 +311,7 @@ def selenium_worker():
         root.after(
             0,
             lambda: lbl_status.config(
-                text='👀 리콜 학습 화면을 기다리는 중...', fg='gray'
+                text='리콜 학습 화면을 기다리는 중...', fg='gray'
             ),
         )
 
@@ -352,7 +352,7 @@ root.bind('<Escape>', stop_macro)
 
 lbl_status = tk.Label(
     root,
-    text='1. 북마크 추출 -> 2. [📋 불러오기] -> 모드 선택',
+    text='1. 북마크 추출 -> 2. [불러오기] -> 모드 선택',
     font=('맑은 고딕', 9),
     fg='gray',
     wraplength=460,
@@ -365,7 +365,7 @@ frame_top = tk.Frame(root)
 frame_top.pack(pady=5)
 btn_load = tk.Button(
     frame_top,
-    text='📋 클립보드 불러오기',
+    text='클립보드 불러오기',
     width=30,
     font=('맑은 고딕', 10, 'bold'),
     fg='#0288D1',
@@ -375,13 +375,13 @@ btn_load.pack()
 
 # 암기 모드 컨트롤 프레임
 frame_memo = tk.LabelFrame(
-    root, text=' 📖 암기 학습 모드 ', font=('맑은 고딕', 9, 'bold')
+    root, text=' 암기 학습 모드 ', font=('맑은 고딕', 9, 'bold')
 )
 frame_memo.pack(pady=8, padx=15, fill='x')
 
 btn_pos = tk.Button(
     frame_memo,
-    text='🎯 학습창 클릭',
+    text='학습창 클릭',
     width=15,
     font=('맑은 고딕', 9, 'bold'),
     fg='#E65100',
@@ -392,7 +392,7 @@ btn_pos.pack(side=tk.LEFT, padx=12, pady=8)
 
 btn_start = tk.Button(
     frame_memo,
-    text='▶ 암기 시작',
+    text='암기 시작',
     width=15,
     font=('맑은 고딕', 9, 'bold'),
     fg='#2E7D32',
@@ -403,13 +403,13 @@ btn_start.pack(side=tk.LEFT, padx=12, pady=8)
 
 # 리콜 학습 모드 컨트롤 프레임
 frame_recall = tk.LabelFrame(
-    root, text=' 🧪 리콜 학습 모드 ', font=('맑은 고딕', 9, 'bold')
+    root, text=' 리콜 학습 모드 ', font=('맑은 고딕', 9, 'bold')
 )
 frame_recall.pack(pady=8, padx=15, fill='x')
 
 btn_recall_start = tk.Button(
     frame_recall,
-    text='🧪 리콜 자동 풀이 시작',
+    text='리콜 자동 풀이 시작',
     width=23,
     font=('맑은 고딕', 10, 'bold'),
     fg='#6A1B9A',
@@ -420,7 +420,7 @@ btn_recall_start.grid(row=0, column=0, padx=12, pady=8)
 
 btn_stop = tk.Button(
     frame_recall,
-    text='■ 정지',
+    text='정지',
     width=8,
     font=('맑은 고딕', 10, 'bold'),
     fg='#C62828',
