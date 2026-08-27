@@ -227,6 +227,28 @@ return null;
 """
 
 
+_DISPATCH_KEY_JS = """
+var key = arguments[0];
+var opts = {key: key, code: key === ' ' ? 'Space' : 'Digit' + key,
+  keyCode: key === ' ' ? 32 : key.charCodeAt(0),
+  which: key === ' ' ? 32 : key.charCodeAt(0),
+  bubbles: true, cancelable: true};
+document.activeElement.dispatchEvent(new KeyboardEvent('keydown', opts));
+document.activeElement.dispatchEvent(new KeyboardEvent('keypress', opts));
+document.activeElement.dispatchEvent(new KeyboardEvent('keyup', opts));
+"""
+
+
+def dispatch_key(driver, key):
+  """ActionChains의 OS 레벨 키 입력이 씹히는 경우를 대비해, JS로 직접
+  keydown/keypress/keyup 이벤트를 발생시키는 대체 경로. 두 방식을 함께
+  쓰면 한쪽이 안 먹혀도 다른 쪽으로 전달될 가능성이 높아진다."""
+  try:
+    driver.execute_script(_DISPATCH_KEY_JS, key)
+  except Exception:
+    pass
+
+
 def read_all_texts(driver, selector):
   """selector에 매칭되는 모든 요소의 textContent를 가시성 판단 없이 그대로
   반환한다. 일부 요소는 checkVisibility 기반 판정(read_visible)이 두 번째
@@ -565,9 +587,20 @@ def test_worker():
   btn_test_start.config(state=tk.DISABLED)
   btn_stop.config(state=tk.NORMAL)
 
-  # F12로 확인: 문제 단어는 .font-36이 붙고, 보기 박스는 안 붙는다.
-  QUESTION_SELECTOR = '.cc-table.middle.fill-parent.font-36'
-  CHOICE_SELECTOR = '.cc-table.middle.fill-parent:not(.font-36)'
+  # F12로 확인: 문제 단어는 텍스트 길이에 따라 폰트 크기 클래스가
+  # font-36/font-32처럼 동적으로 바뀐다(길수록 작은 폰트) — 그래서
+  # .font-36으로 고정하면 긴 문구에서 아예 매칭이 안 됐다. class 안에
+  # "font-"가 들어간 것만 문제, 없는 것만 보기 박스로 구분한다.
+  #
+  # 또한 뒤로 갈수록 남은 카드들이 미리 렌더링돼 문제 후보가 20개 넘게
+  # 한꺼번에 잡히고, 그중 맨 앞 것을 현재 문제로 착각해 계속 실패했다.
+  # 카드는 .flip-card로 감싸여 있고 현재 카드만 .next/.hidden이 없으므로
+  # (F12 확인: "flip-card showing flip" vs "flip-card next"/"flip-card
+  # hidden") 현재 카드 안으로 범위를 좁혀서 찾는다.
+  CURRENT_CARD = '.flip-card:not(.next):not(.hidden)'
+  FALLBACK_QUESTION_SELECTOR = '.cc-table.middle.fill-parent[class*="font-"]'
+  QUESTION_SELECTOR = f'{CURRENT_CARD} {FALLBACK_QUESTION_SELECTOR}'
+  CHOICE_SELECTOR = '.cc-table.middle.fill-parent:not([class*="font-"])'
 
   try:
     driver = get_driver()
@@ -580,7 +613,9 @@ def test_worker():
     )
 
     seen_keys = set()
+    fail_counts = {}
     last_logged_qtext = None
+    empty_streak = 0
 
     while is_running:
       current_word = None
@@ -590,11 +625,23 @@ def test_worker():
       # 문제 진행 중간부터 방향이 뒤집혀(영어->한글 뜻 이었다가 한글 뜻->영어로)
       # 화면에 뜬 텍스트가 word_list의 eng와 일치하는지, kor(태그 뗀 것 포함)와
       # 일치하는지를 매번 판별해서 어느 시점에 바뀌든 대응한다.
-      # 가시성 판단 없이 읽으면(read_all_texts) 아직 화면에 나오지도 않은
-      # 미래 문제까지 미리 로드된 걸 새 문제로 착각해 실제 화면보다 앞서
-      # 나가는 문제가 있었다 — 실제로 화면에 보이는 것만 걸러야 한다.
+      # checkVisibility 판정이 이 요소에서 아주 가끔 실제로 보이는데도
+      # 실패하는 경우가 있다(셀렉터 자체는 F12로 확인해 정상 매칭됨). 매번
+      # 안 보일 때마다 바로 백업 방식을 쓰면 미래 문제까지 한꺼번에 잡히는
+      # 부작용이 있었으므로, 여러 번(약 1.5초) 연속으로 계속 비어있을 때만
+      # 백업으로 가시성 판단 없이 원시 텍스트를 읽는다.
       q_visible = read_visible(driver, QUESTION_SELECTOR)
       q_candidates = [t for _, t in q_visible]
+      if q_candidates:
+        empty_streak = 0
+      else:
+        empty_streak += 1
+        if empty_streak >= 5:
+          # 현재 카드 범위로 못 찾으면(카드 클래스 구성이 예상과 다를 때)
+          # 마지막 수단으로 범위 제한 없이 다시 찾아본다.
+          q_candidates = read_all_texts(driver, QUESTION_SELECTOR)
+          if not q_candidates:
+            q_candidates = read_all_texts(driver, FALLBACK_QUESTION_SELECTOR)
 
       if q_candidates != last_logged_qtext:
         print(f"[DEBUG] 화면에 실제로 보이는 문제 텍스트들={q_candidates}")
@@ -632,21 +679,33 @@ def test_worker():
         # (이 화면은 "생각할 시간"을 따로 안 기다려도 됨 - 사용자 확인).
         # body.click()으로 매번 포커스를 다시 잡아야 한다 — 포커스가 다른
         # 곳으로 새면 키 입력이 실제 화면에 전혀 반영되지 않은 채로 계속
-        # 헛도는 문제가 있었다.
-        driver.find_element(By.TAG_NAME, 'body').click()
-        time.sleep(0.2)
-        ActionChains(driver).send_keys(Keys.SPACE).perform()
-        time.sleep(0.3)
-
-        # 보기 6개가 화면에 실제로 렌더링될 때까지 최대 2초 재시도.
+        # 헛도는 문제가 있었다. 가끔 스페이스 한 번이 안 먹히는 경우가
+        # 있어서, 보기가 안 뜨면 스페이스를 다시 눌러보며 최대 3번 시도한다.
+        # 문제가 뒤로 갈수록 DOM에 카드가 계속 쌓여 사이트 반응이 점점
+        # 느려지는 것으로 보여, 클릭/키 입력 후 대기 시간과 재시도 횟수를
+        # 넉넉하게 잡는다.
         choices, attempt = [], 0
-        for attempt in range(20):
+        for space_try in range(3):
           if not is_running:
             break
-          choices = read_visible(driver, CHOICE_SELECTOR)
-          if choices:
+          driver.find_element(By.TAG_NAME, 'body').click()
+          time.sleep(0.15)
+          ActionChains(driver).send_keys(Keys.SPACE).perform()
+          dispatch_key(driver, ' ')
+          time.sleep(0.3)
+
+          # 보기 6개가 화면에 실제로 렌더링될 때까지 최대 2.5초 재시도.
+          for attempt in range(25):
+            if not is_running:
+              break
+            choices = read_visible(driver, CHOICE_SELECTOR)
+            if choices:
+              break
+            time.sleep(0.1)
+
+          if choices or not is_running:
             break
-          time.sleep(0.1)
+          print(f"[DEBUG] 보기 화면이 안 떠서 스페이스 재시도 ({space_try + 1}회차)")
 
         debug_texts = [t for _, t in choices]
         print(
@@ -676,8 +735,9 @@ def test_worker():
               digit = for_attr.rsplit('_', 1)[-1]
               if digit.isdigit():
                 driver.find_element(By.TAG_NAME, 'body').click()
-                time.sleep(0.2)
+                time.sleep(0.15)
                 ActionChains(driver).send_keys(digit).perform()
+                dispatch_key(driver, digit)
                 pressed = True
             except StaleElementReferenceException:
               pass
@@ -687,6 +747,7 @@ def test_worker():
         print(f"[DEBUG] 매칭성공={pressed}")
 
         if pressed and is_running:
+          fail_counts.pop(current_cand_norm, None)
           seen_keys.add(current_cand_norm)
           root.after(
               0,
@@ -696,6 +757,16 @@ def test_worker():
               ),
           )
           time.sleep(0.4)
+        elif is_running:
+          # 백업 방식(read_all_texts)이 아직 화면에 없는 미래 문제를 잘못
+          # 집었을 때, 실패해도 처리 완료로 기록을 안 해두면 매번 같은
+          # 틀린 후보를 무한 반복하게 된다. 같은 후보가 몇 번 연속 실패하면
+          # 포기하고 넘어가서 다른 후보(진짜 현재 문제)를 시도할 기회를 준다.
+          fail_counts[current_cand_norm] = fail_counts.get(current_cand_norm, 0) + 1
+          if fail_counts[current_cand_norm] >= 3:
+            print(f"[DEBUG] '{current_cand_norm}' 계속 실패해서 포기하고 넘어감")
+            seen_keys.add(current_cand_norm)
+            fail_counts.pop(current_cand_norm, None)
       else:
         root.after(
             0,
