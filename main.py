@@ -6,7 +6,13 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 import pyautogui
-from selenium import webdriver
+# selenium 4.28+ 는 webdriver.Chrome / webdriver.ChromeOptions 를 importlib
+# 기반 지연 임포트로 노출한다. PyInstaller가 정적 분석으로 이걸 못 찾아서
+# exe로 빌드하면 실행 중에 "No module named
+# 'selenium.webdriver.chrome.options'" 에러가 났다. 실제 모듈을 직접
+# 임포트해두면 빌드에도 확실히 포함된다.
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.webdriver import WebDriver as ChromeDriver
 from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -41,9 +47,9 @@ def get_driver():
     except Exception:
       shared_driver = None  # 창이 닫혔으면 새로 띄운다
 
-  options = webdriver.ChromeOptions()
+  options = ChromeOptions()
   options.add_experimental_option('detach', True)
-  shared_driver = webdriver.Chrome(options=options)
+  shared_driver = ChromeDriver(options=options)
   shared_driver.get('https://www.classcard.net')
   return shared_driver
 
