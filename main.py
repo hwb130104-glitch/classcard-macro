@@ -1444,11 +1444,18 @@ def on_kind_change():
       command=run_sentence_scramble if is_sentence else start_macro,
   )
 
-  # 문장 리콜은 듣고 낱말을 배열하는 방식이라 영작 연습과 화면 구조가 같다.
+  # 문장 단어장은 리콜(듣고 배열)도 스펠도 낱말을 순서대로 누르는 방식이라
+  # 영작 연습과 화면 구조가 같다. 셋 다 같은 워커를 쓴다.
   frame_recall.config(text=' 리콜 (듣고 배열) ' if is_sentence else ' 리콜 ')
   btn_recall_start.config(
       text='리콜 자동 풀이 시작',
       command=run_sentence_scramble if is_sentence else run_recall_selenium,
+  )
+
+  frame_spell.config(text=' 스펠 (배열) ' if is_sentence else ' 스펠 ')
+  btn_spell_start.config(
+      text='스펠 자동 풀이 시작',
+      command=run_sentence_scramble if is_sentence else run_spelling_selenium,
   )
 
 
