@@ -193,6 +193,38 @@ def _strip_pos_tag(text):
   return re.sub(r'^\[[^\]]+\]\s*', '', text).strip()
 
 
+def _norm_space(text):
+  """앞뒤 공백을 없애고 중간 공백도 한 칸으로 통일한다."""
+  return re.sub(r'\s+', ' ', text or '').strip()
+
+
+def _pick_choice(choices, target):
+  """보기 목록에서 정답 보기를 골라 (인덱스, 요소, 텍스트)를 돌려준다.
+
+  단순 포함(in) 비교만 하면 '[형] 신'을 찾을 때 위에 있는 '[형] 신축성
+  있는'이 먼저 걸려서 오답을 골랐다(리콜/테스트 양쪽에서 실제로 발생).
+  완전히 같은 것 -> 품사 태그만 뗀 것이 같은 것 -> 마지막 수단으로 포함
+  관계 순으로 단계를 나눠서, 정확한 보기가 있으면 항상 그쪽을 고른다."""
+  target_norm = _norm_space(target)
+  target_stripped = _strip_pos_tag(target_norm)
+  items = []
+  for idx, (el, raw) in enumerate(choices):
+    txt = _norm_space(raw)
+    if txt:
+      items.append((idx, el, txt, _strip_pos_tag(txt)))
+
+  for idx, el, txt, txt_stripped in items:
+    if txt == target_norm:
+      return idx, el, txt
+  for idx, el, txt, txt_stripped in items:
+    if target_stripped and txt_stripped == target_stripped:
+      return idx, el, txt
+  for idx, el, txt, txt_stripped in items:
+    if target_norm in txt or txt in target_norm:
+      return idx, el, txt
+  return None
+
+
 _VISIBLE_JS = """
 function isReallyVisible(el) {
   if (typeof el.checkVisibility === 'function') {
@@ -386,21 +418,20 @@ def selenium_worker():
         )
 
         pressed = False
-        for i, (choice_el, txt) in enumerate(choices[:4]):
-          if not is_running:
-            break
-          if txt and target_kor in txt:
-            try:
-              body = driver.find_element(By.TAG_NAME, 'body')
-              body.click()
-              time.sleep(0.3)
-              ActionChains(driver).send_keys(str(i + 1)).perform()
-              pressed = True
-            except StaleElementReferenceException:
-              pass
-            except Exception as e:
-              print('키 입력 에러:', e)
-            break
+        picked = _pick_choice(choices[:4], target_kor)
+        if picked and is_running:
+          i, _, matched_text = picked
+          print(f"[DEBUG] 고른 보기={i + 1}번 '{matched_text}'")
+          try:
+            body = driver.find_element(By.TAG_NAME, 'body')
+            body.click()
+            time.sleep(0.3)
+            ActionChains(driver).send_keys(str(i + 1)).perform()
+            pressed = True
+          except StaleElementReferenceException:
+            pass
+          except Exception as e:
+            print('키 입력 에러:', e)
         print(f"[DEBUG] 매칭성공={pressed}")
 
         if pressed and is_running:
@@ -676,7 +707,6 @@ def test_worker():
             if direction == 'eng_to_kor'
             else current_word['eng'].strip()
         )
-        target_stripped = _strip_pos_tag(target_answer)
         dir_label = '영단어->한글 뜻' if direction == 'eng_to_kor' else '한글 뜻->영단어'
         msg = f"단어 감지({dir_label}): 정답 '{target_answer}' 찾는 중"
         root.after(0, lambda m=msg: lbl_status.config(text=m, fg='#0288D1'))
@@ -720,36 +750,27 @@ def test_worker():
         )
 
         pressed = False
-        for choice_el, txt in choices:
-          if not is_running:
-            break
-          txt_norm = txt.strip()
-          if not txt_norm:
-            continue
-          if (
-              txt_norm == target_answer
-              or txt_norm == target_stripped
-              or txt_norm in target_answer
-              or target_stripped in txt_norm
-          ):
-            try:
-              # 보기 각각은 <label for="radio_0_N">으로 감싸여 있고 N이 곧
-              # 눌러야 할 번호다. 위치를 세는 대신 이 속성에서 직접 읽으면
-              # DOM에 잔여 요소가 섞여 있어도 정확한 번호를 알 수 있다.
-              label_el = choice_el.find_element(By.XPATH, './ancestor::label[1]')
-              for_attr = label_el.get_attribute('for') or ''
-              digit = for_attr.rsplit('_', 1)[-1]
-              if digit.isdigit():
-                driver.find_element(By.TAG_NAME, 'body').click()
-                time.sleep(0.15)
-                ActionChains(driver).send_keys(digit).perform()
-                dispatch_key(driver, digit)
-                pressed = True
-            except StaleElementReferenceException:
-              pass
-            except Exception as e:
-              print('선택 에러:', e)
-            break
+        picked = _pick_choice(choices, target_answer)
+        if picked and is_running:
+          _, choice_el, matched_text = picked
+          print(f"[DEBUG] 고른 보기='{matched_text}'")
+          try:
+            # 보기 각각은 <label for="radio_0_N">으로 감싸여 있고 N이 곧
+            # 눌러야 할 번호다. 위치를 세는 대신 이 속성에서 직접 읽으면
+            # DOM에 잔여 요소가 섞여 있어도 정확한 번호를 알 수 있다.
+            label_el = choice_el.find_element(By.XPATH, './ancestor::label[1]')
+            for_attr = label_el.get_attribute('for') or ''
+            digit = for_attr.rsplit('_', 1)[-1]
+            if digit.isdigit():
+              driver.find_element(By.TAG_NAME, 'body').click()
+              time.sleep(0.15)
+              ActionChains(driver).send_keys(digit).perform()
+              dispatch_key(driver, digit)
+              pressed = True
+          except StaleElementReferenceException:
+            pass
+          except Exception as e:
+            print('선택 에러:', e)
         print(f"[DEBUG] 매칭성공={pressed}")
 
         if pressed and is_running:
