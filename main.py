@@ -97,7 +97,10 @@ def memo_worker():
   예전에는 PyAutoGUI로 화면 좌표를 클릭해 포커스를 넘긴 뒤 OS 레벨로 키를
   보냈다(시작 전 5초 동안 마우스를 카드 위로 옮겨야 했다). 이제는 다른
   모드와 똑같이 공유 크롬 창에 셀레니움으로 키를 보내므로, 마우스를 어디
-  두든 상관없고 창이 따로 뜨지도 않는다."""
+  두든 상관없고 창이 따로 뜨지도 않는다.
+
+  주소가 /Memorize/로 바뀌어도 사이트에서 [시작]을 눌러야 학습이 시작되기
+  때문에, 화면을 감지하면 5초를 세고 나서 키를 보내기 시작한다."""
   global is_running
 
   is_running = True
@@ -119,11 +122,9 @@ def memo_worker():
         ),
     )
 
-    total = len(word_list)
-    idx = 0
-    waiting_logged = False
+    ready = False
 
-    while is_running and idx < total:
+    while is_running:
       # 구간이 끝나 완료 화면이 떠 있으면 먼저 다음 구간으로 넘긴다.
       if handle_section_done(driver):
         continue
@@ -131,9 +132,9 @@ def memo_worker():
       # 암기 학습 화면에 들어왔을 때만 키를 보낸다. 로그인하고 학습
       # 화면까지 들어가는 동안은 조용히 기다린다.
       if not on_memorize_screen(driver):
-        if not waiting_logged:
-          print('[DEBUG] 암기 화면 대기 중 (주소에 /Memorize/ 없음)')
-          waiting_logged = True
+        if ready:
+          print('[DEBUG] 암기 화면을 벗어남 - 다시 대기')
+          ready = False
         root.after(
             0,
             lambda: lbl_status.config(
@@ -143,9 +144,32 @@ def memo_worker():
         time.sleep(0.5)
         continue
 
-      if waiting_logged:
-        print('[DEBUG] 암기 화면 감지 - 시작')
-        waiting_logged = False
+      if not ready:
+        # 주소가 바뀌어도 사이트에서 [시작]을 눌러야 학습이 시작된다.
+        # 그 사이에 키를 보내면 엉뚱한 곳에 들어가므로 5초를 세고 시작한다.
+        print('[DEBUG] 암기 화면 감지 - 5초 후 시작')
+        for remain in range(5, 0, -1):
+          if not is_running or not on_memorize_screen(driver):
+            break
+          root.after(
+              0,
+              lambda r=remain: lbl_status.config(
+                  text=f'암기 화면 확인! {r}초 후 시작합니다...', fg='#1976D2'
+              ),
+          )
+          time.sleep(1)
+
+        if not is_running or not on_memorize_screen(driver):
+          continue
+
+        ready = True
+        root.after(
+            0,
+            lambda: lbl_status.config(
+                text='암기 자동 학습 진행 중... ([정지] 클릭 시 중단)',
+                fg='#388E3C',
+            ),
+        )
 
       try:
         driver.find_element(By.TAG_NAME, 'body').click()
@@ -168,19 +192,6 @@ def memo_worker():
 
       ActionChains(driver).send_keys(Keys.ARROW_RIGHT).perform()
       time.sleep(0.3)
-
-      idx += 1
-      root.after(
-          0,
-          lambda i=idx, n=total: lbl_status.config(
-              text=f'암기 자동 학습 진행 중... ({i}/{n})', fg='#388E3C'
-          ),
-      )
-
-    if is_running:
-      root.after(
-          0, lambda: lbl_status.config(text='암기 학습 완료!', fg='#388E3C')
-      )
 
   except Exception as e:
     err_msg = str(e)
