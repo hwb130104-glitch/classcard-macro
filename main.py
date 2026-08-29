@@ -1040,23 +1040,22 @@ _SCRAMBLE_JS = r"""
 // 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
 // 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
 // 긴 문장은 조각이 한 줄에 안 들어가 뒷부분이 '...'로 잘려 보인다. 잘린
-// 조각도 DOM에는 있으므로, 필요한 낱말을 화면에서 못 찾으면 includeHidden으로
-// 다시 읽는다.
-var includeHidden = arguments[0];
+// 조각도 DOM에는 있으므로 전부 돌려주되, 하나하나 화면에 보이는지(vis)를
+// 같이 넘긴다. 파이썬 쪽에서 '한 조각도 안 보이는 카드'는 지난 카드로 보고
+// 버리고, 남은 카드는 잘린 조각까지 다 세어 몇 낱말이 남았는지 계산한다.
 var nodes = document.querySelectorAll('.scramble-item, .btn-scramble');
 var parents = [];
 var groups = [];
 for (var i = 0; i < nodes.length; i++) {
   var el = nodes[i];
-  if (!includeHidden && typeof el.checkVisibility === 'function') {
+  var vis = true;
+  if (typeof el.checkVisibility === 'function') {
     try {
-      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
-        continue;
-      }
+      vis = el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
     } catch (e) {}
   }
   var r = el.getBoundingClientRect();
-  if (!includeHidden && (r.width <= 0 || r.height <= 0)) continue;
+  if (r.width <= 0 || r.height <= 0) vis = false;
   var p = el.parentElement;
   var idx = parents.indexOf(p);
   if (idx === -1) {
@@ -1064,23 +1063,28 @@ for (var i = 0; i < nodes.length; i++) {
     groups.push([]);
     idx = groups.length - 1;
   }
-  groups[idx].push({el: el, text: (el.textContent || '').trim()});
+  groups[idx].push({el: el, text: (el.textContent || '').trim(), vis: vis});
 }
 return groups;
 """
 
 
-def read_scramble_groups(driver, include_hidden=False):
-  """낱말 조각을 카드별로 묶어 [[(요소, 글자), ...], ...] 로 돌려준다.
+def read_scramble_groups(driver):
+  """지금 화면에 떠 있는 카드의 낱말 조각을 [[(요소, 글자), ...], ...] 로.
 
-  include_hidden=True면 '...'로 잘려 화면에 안 보이는 조각까지 포함한다."""
+  잘려서 안 보이는 조각도 포함한다 - 남은 낱말이 몇 개인지 정확히 알아야
+  지금 눌러야 할 자리를 계산할 수 있다. 다만 조각이 하나도 안 보이는
+  묶음은 지난 카드로 보고 버린다(이 사이트는 지난 카드가 DOM에 그대로
+  남는다)."""
   try:
-    raw = driver.execute_script(_SCRAMBLE_JS, bool(include_hidden)) or []
+    raw = driver.execute_script(_SCRAMBLE_JS) or []
   except Exception:
     return []
 
   groups = []
   for group in raw:
+    if not any(d.get('vis') for d in group):
+      continue
     items = [(d['el'], d['text']) for d in group if d.get('text')]
     if items:
       groups.append(items)
@@ -1163,98 +1167,96 @@ def _pick_group_for(groups, tokens):
   return best_items
 
 
+def _next_token_index(tokens, chips):
+  """남은 조각들로 미루어, 지금 눌러야 할 낱말이 문장의 몇 번째인지.
+
+  조각은 '아직 안 놓인 낱말'만 남아 있고, 놓인 낱말은 항상 문장 앞부분이다.
+  그래서 tokens의 뒤쪽 일부가 조각을 전부 포함하는 가장 늦은 지점을 찾으면
+  그게 다음에 눌러야 할 자리다. 예: 13낱말 문장에서 조각이
+  [the, fresh, air, there]면 9번째부터 남은 것이므로 tokens[9]를 누른다.
+
+  잘린 조각까지 다 읽으면 남은 낱말과 개수가 정확히 맞으므로 그 지점이
+  확실하다. 혹시 일부만 잡혔을 때를 대비해, 안 맞으면 조각을 전부 포함하는
+  가장 늦은 지점으로 대신한다."""
+  k0 = len(tokens) - len(chips)
+  if k0 >= 0 and sorted(tokens[k0:]) == sorted(chips):
+    return k0
+  for k in range(k0, -1, -1):
+    if _is_submultiset(chips, tokens[k:]):
+      return k
+  return None
+
+
 def click_scramble_in_order(driver, tokens):
   """정답 순서대로 조각을 클릭한다.
 
-  긴 문장은 앞 조각을 눌러야 뒤 조각이 자리로 들어오므로, 낱말마다 화면을
-  다시 읽는다. 화면에서 못 찾으면 잘려서 안 보이는 조각까지 뒤진다.
-  'I ... I ...'처럼 같은 낱말이 두 번 나오는 문장이 있어서 이미 누른 조각은
-  따로 기억해두고 건너뛴다.
+  한 번 누를 때마다 화면을 다시 읽고 '다음에 누를 낱말'을 새로 계산한다.
+  처음엔 시작할 때 한 번만 훑어서 건너뛸 낱말을 정했는데, 조각이 남은
+  낱말만 조금씩 나타나는 화면(리콜)에서는 아직 안 나온 낱말까지 '이미
+  놓였다'고 잘못 판단해 문장을 중간까지만 배열했다.
 
-  리콜(듣고 배열)은 첫 낱말을 미리 채워둔 채로 시작한다. 그 낱말은 조각이
-  아예 없으므로, 시작할 때 조각 전체를 훑어서 눌러야 할 낱말만 추린다."""
-  todo = tokens
-  pool = [
-      _norm_token(txt)
-      for _, txt in _pick_group_for(
-          read_scramble_groups(driver, include_hidden=True), tokens
-      )
-  ]
-  if pool:
-    # 부족한 낱말은 '앞에서부터' 건너뛴다. 미리 채워지는 건 문장 앞부분이라
-    # 'I ... I ...'처럼 같은 낱말이 두 번 나올 때 뒤쪽을 건너뛰면 순서가
-    # 통째로 어긋난다.
-    need, have = {}, {}
-    for tok in tokens:
-      need[tok] = need.get(tok, 0) + 1
-    for tok in pool:
-      have[tok] = have.get(tok, 0) + 1
-    to_skip = {t: max(0, n - have.get(t, 0)) for t, n in need.items()}
-
-    todo, skipped = [], []
-    for tok in tokens:
-      if to_skip.get(tok, 0) > 0:
-        to_skip[tok] -= 1
-        skipped.append(tok)
-      else:
-        todo.append(tok)
-
-    if skipped:
-      print(f'[DEBUG] 이미 놓여 있어 건너뛴 낱말={skipped}')
-    if not todo:
-      return False
-
+  긴 문장은 조각이 '...'로 잘려 보이는데, 잘린 것도 셈에는 넣고 클릭은
+  자바스크립트로 한다(잘린 요소는 일반 클릭이 막힌다). 이미 누른 조각은
+  따로 기억해 다시 누르지 않는다."""
   used = []
 
-  for pos, tok in enumerate(todo):
-    clicked = False
+  for step in range(len(tokens) * 2 + 4):
+    if not is_running:
+      return False
 
-    for attempt in range(20):  # 조각이 나타날 때까지 최대 2초
+    # 잘려서 안 보이는 조각까지 포함해 읽는다. 남은 낱말이 몇 개인지
+    # 정확히 알아야 지금 눌러야 할 자리를 계산할 수 있다.
+    items = []
+    for attempt in range(15):  # 다음 조각이 나타날 때까지 최대 1.5초
       if not is_running:
         return False
-
-      # 화면에 보이는 조각부터 찾고, 없으면 잘려서 안 보이는 조각까지 뒤진다.
-      for include_hidden in (False, True):
-        groups = read_scramble_groups(driver, include_hidden=include_hidden)
-        items = _pick_group_for(groups, tokens)
-
-        for el, txt in items:
-          if _norm_token(txt) != tok:
-            continue
-          if any(el == prev for prev in used):
-            continue
-          try:
-            if include_hidden:
-              # 잘린 조각은 셀레니움 클릭이 막히므로 JS로 누른다.
-              driver.execute_script('arguments[0].click();', el)
-            else:
-              el.click()
-          except StaleElementReferenceException:
-            continue
-          except Exception:
-            try:
-              driver.execute_script('arguments[0].click();', el)
-            except Exception as e:
-              print('조각 클릭 에러:', e)
-              return False
-          used.append(el)
-          clicked = True
-          break
-
-        if clicked:
-          break
-
-      if clicked:
+      groups = read_scramble_groups(driver)
+      items = [
+          (el, txt)
+          for el, txt in _pick_group_for(groups, tokens)
+          if not any(el == prev for prev in used)
+      ]
+      if items:
         break
       time.sleep(0.1)
 
-    if not clicked:
-      print(f"[DEBUG] '{tok}'({pos + 1}번째) 조각이 안 나타나 이번 문장 중단")
+    if not items:
+      return True  # 더 놓을 조각이 없으면 문장을 다 배열한 것
+
+    chips = [_norm_token(txt) for _, txt in items]
+    k = _next_token_index(tokens, chips)
+    if k is None or k >= len(tokens):
+      print(f'[DEBUG] 남은 조각 {chips} 이 문장과 안 맞아 중단')
       return False
 
+    tok = tokens[k]
+    target = None
+    for el, txt in items:
+      if _norm_token(txt) == tok:
+        target = el
+        break
+
+    if target is None:
+      # 눌러야 할 낱말이 아직 화면에 안 들어왔다. 잠깐 뒤에 다시 본다.
+      time.sleep(0.1)
+      continue
+
+    try:
+      target.click()
+    except StaleElementReferenceException:
+      continue
+    except Exception:
+      try:
+        driver.execute_script('arguments[0].click();', target)
+      except Exception as e:
+        print('조각 클릭 에러:', e)
+        return False
+
+    used.append(target)
     time.sleep(0.07)
 
-  return True
+  print('[DEBUG] 조각을 다 못 눌러서 중단')
+  return False
 
 
 # --- 문장 암기(영작 연습) 자동 풀이 스레드 ---
