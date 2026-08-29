@@ -5,7 +5,6 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
-import pyautogui
 # selenium 4.28+ 는 webdriver.Chrome / webdriver.ChromeOptions 를 importlib
 # 기반 지연 임포트로 노출한다. PyInstaller가 정적 분석으로 이걸 못 찾아서
 # exe로 빌드하면 실행 중에 "No module named
@@ -18,10 +17,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
-# --- DPI 및 PyAutoGUI 설정 ---
-pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0.03
-
+# --- DPI 설정 ---
 try:
   ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -32,7 +28,6 @@ except Exception:
 
 is_running = False
 word_list = []
-target_click_pos = None
 shared_driver = None
 
 
@@ -95,66 +90,17 @@ def load_from_clipboard():
     )
 
 
-# --- 암기 학습 루프 ---
-def run_macro_loop():
-  global is_running, word_list, target_click_pos
+# --- 암기 학습 자동 진행 스레드 ---
+def memo_worker():
+  """단어 암기: 카드에서 space -> shift+space -> 오른쪽 화살표를 반복한다.
 
-  if target_click_pos:
-    pyautogui.click(target_click_pos.x, target_click_pos.y)
-    time.sleep(0.3)
-
-  total = len(word_list)
-  idx = 0
-
-  while is_running and idx < total:
-    if not is_running:
-      break
-
-    pyautogui.press('space')
-    time.sleep(0.2)
-    if not is_running:
-      break
-
-    pyautogui.hotkey('shift', 'space')
-    time.sleep(0.2)
-    if not is_running:
-      break
-
-    pyautogui.press('right')
-    time.sleep(0.3)
-
-    idx += 1
-
-  if is_running:
-    root.after(
-        0, lambda: lbl_status.config(text='암기 학습 완료!', fg='#388E3C')
-    )
-    stop_macro()
-
-
-def start_macro():
-  global is_running, target_click_pos
-  if not word_list:
-    messagebox.showwarning('알림', '먼저 단어를 불러와주세요.')
-    return
-
-  # 버튼을 누른 순간 포커스는 이 프로그램(Tkinter 창)에 가있어서, 그대로
-  # 키 입력을 보내면 학습창이 아니라 여기로 전달된다. 5초 안에 학습창의
-  # 카드 중앙으로 마우스를 이동시켜두면 그 위치를 기억했다가 매크로 시작
-  # 직전에 실제로 클릭해서 포커스를 넘긴다.
-  lbl_status.config(
-      text='5초 내에 암기학습 [카드 중앙]으로 마우스를 이동하세요!', fg='#1976D2'
-  )
-  root.update()
-  time.sleep(5)
-
-  target_click_pos = pyautogui.position()
+  예전에는 PyAutoGUI로 화면 좌표를 클릭해 포커스를 넘긴 뒤 OS 레벨로 키를
+  보냈다(시작 전 5초 동안 마우스를 카드 위로 옮겨야 했다). 이제는 다른
+  모드와 똑같이 공유 크롬 창에 셀레니움으로 키를 보내므로, 마우스를 어디
+  두든 상관없고 창이 따로 뜨지도 않는다."""
+  global is_running
 
   is_running = True
-  lbl_status.config(
-      text='암기 자동 학습 진행 중... ([정지] 버튼 클릭 시 중단)',
-      fg='#388E3C',
-  )
   btn_load.config(state=tk.DISABLED)
   btn_start.config(state=tk.DISABLED)
   btn_recall_start.config(state=tk.DISABLED)
@@ -162,7 +108,76 @@ def start_macro():
   btn_test_start.config(state=tk.DISABLED)
   btn_stop.config(state=tk.NORMAL)
 
-  t = threading.Thread(target=run_macro_loop, daemon=True)
+  try:
+    driver = get_driver()
+    root.after(
+        0,
+        lambda: lbl_status.config(
+            text='크롬에서 암기 학습 화면으로 이동하세요.', fg='#0288D1'
+        ),
+    )
+
+    total = len(word_list)
+    idx = 0
+
+    while is_running and idx < total:
+      # 구간이 끝나 완료 화면이 떠 있으면 먼저 다음 구간으로 넘긴다.
+      if handle_section_done(driver):
+        continue
+
+      try:
+        driver.find_element(By.TAG_NAME, 'body').click()
+      except Exception:
+        pass
+      time.sleep(0.1)
+
+      ActionChains(driver).send_keys(Keys.SPACE).perform()
+      dispatch_key(driver, ' ')
+      time.sleep(0.2)
+      if not is_running:
+        break
+
+      ActionChains(driver).key_down(Keys.SHIFT).send_keys(
+          Keys.SPACE
+      ).key_up(Keys.SHIFT).perform()
+      time.sleep(0.2)
+      if not is_running:
+        break
+
+      ActionChains(driver).send_keys(Keys.ARROW_RIGHT).perform()
+      time.sleep(0.3)
+
+      idx += 1
+      root.after(
+          0,
+          lambda i=idx, n=total: lbl_status.config(
+              text=f'암기 자동 학습 진행 중... ({i}/{n})', fg='#388E3C'
+          ),
+      )
+
+    if is_running:
+      root.after(
+          0, lambda: lbl_status.config(text='암기 학습 완료!', fg='#388E3C')
+      )
+
+  except Exception as e:
+    err_msg = str(e)
+    root.after(
+        0,
+        lambda: messagebox.showerror(
+            '셀레니움 에러', f'오류가 발생했습니다:\n{err_msg}'
+        ),
+    )
+  finally:
+    root.after(0, stop_macro)
+
+
+def start_macro():
+  if not word_list:
+    messagebox.showwarning('알림', '먼저 단어를 불러와주세요.')
+    return
+
+  t = threading.Thread(target=memo_worker, daemon=True)
   t.start()
 
 

@@ -1,7 +1,7 @@
 # 클래스카드 매크로
 
 클래스카드(classcard.net) 단어장의 **암기 / 리콜 / 스펠 / 테스트** 학습을 자동화하는 Windows용 데스크톱 프로그램입니다.
-Python(Tkinter) GUI + Selenium(브라우저 자동화) + PyAutoGUI(키/마우스 입력)로 동작합니다.
+Python(Tkinter) GUI + Selenium(브라우저 자동화)으로 동작합니다.
 
 > **그냥 쓰기만 하실 분**은 아래 요구사항/설치 안내를 볼 필요 없이, [Releases](../../releases)에서 설치 파일(`Classcard_Setup.exe`)만 받아서 설치하면 바로 사용할 수 있습니다. Python이나 pip 설치가 필요 없습니다.
 > 아래 안내는 소스코드를 직접 실행하거나 수정하고 싶은 분들을 위한 것입니다.
@@ -18,7 +18,7 @@ Python(Tkinter) GUI + Selenium(브라우저 자동화) + PyAutoGUI(키/마우스
 ## 요구사항
 
 - Python 3.x (일반사용자는 X)
-- Google Chrome (리콜 모드는 Selenium으로 Chrome을 직접 띄웁니다)
+- Google Chrome (모든 모드가 Selenium으로 Chrome을 직접 띄웁니다)
 - 아래 패키지 설치:
 
 ```bash 
@@ -47,7 +47,7 @@ python main.py
 ### 3-A. 암기 학습 모드
 
 1. `클립보드 불러오기` → `암기 시작` 클릭
-2. 5초 안에 암기 학습창의 카드 중앙으로 마우스를 이동 (자동으로 그 위치를 클릭해 포커스를 넘김)
+2. Chrome에서 암기 학습 화면으로 이동
 3. 자동으로 카드가 넘어갑니다
 4. 중단하려면 맨 아래 `정지` 또는 `Esc`
 
