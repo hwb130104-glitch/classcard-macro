@@ -1233,7 +1233,7 @@ def click_scramble_in_order(driver, tokens):
     # 잘려서 안 보이는 조각까지 포함해 읽는다. 남은 낱말이 몇 개인지
     # 정확히 알아야 지금 눌러야 할 자리를 계산할 수 있다.
     items = []
-    for attempt in range(15):  # 다음 조각이 나타날 때까지 최대 1.5초
+    for attempt in range(30):  # 다음 조각이 나타날 때까지 최대 1.5초
       if not is_running:
         return False
       groups = read_scramble_groups(driver)
@@ -1244,7 +1244,9 @@ def click_scramble_in_order(driver, tokens):
       ]
       if items:
         break
-      time.sleep(0.1)
+      # 조각을 누르면 트레이가 다시 그려지느라 잠깐 비는 순간이 있다.
+      # 촘촘히 확인해서 그 틈을 오래 기다리지 않는다.
+      time.sleep(0.05)
 
     if not items:
       return True  # 더 놓을 조각이 없으면 문장을 다 배열한 것
@@ -1270,7 +1272,7 @@ def click_scramble_in_order(driver, tokens):
 
     if target is None:
       # 눌러야 할 낱말이 아직 화면에 안 들어왔다. 잠깐 뒤에 다시 본다.
-      time.sleep(0.1)
+      time.sleep(0.05)
       continue
 
     try:
