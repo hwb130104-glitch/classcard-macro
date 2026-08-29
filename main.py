@@ -1251,6 +1251,29 @@ def on_kind_change():
   암기만 완전히 다르다 - 단어는 카드 넘기기(PyAutoGUI), 문장은 낱말을
   순서대로 클릭하는 영작 연습이다."""
   is_sentence = study_kind.get() == 'sentence'
+
+  # 어느 쪽이 켜져 있는지 한눈에 보이도록 색/눌린 모양까지 바꾼다.
+  # (라디오버튼 기본 표시는 회색 배경이라 구분이 잘 안 됐다)
+  for value, button in kind_buttons.items():
+    if value == study_kind.get():
+      button.config(
+          relief='sunken',
+          bg='#6A1B9A',
+          fg='white',
+          selectcolor='#6A1B9A',
+          activebackground='#6A1B9A',
+          activeforeground='white',
+      )
+    else:
+      button.config(
+          relief='raised',
+          bg='#ECECEC',
+          fg='#777777',
+          selectcolor='#ECECEC',
+          activebackground='#DDDDDD',
+          activeforeground='#333333',
+      )
+
   frame_memo.config(text=' 암기 (영작 연습) ' if is_sentence else ' 암기 ')
   btn_start.config(
       text='영작 연습 시작' if is_sentence else '암기 시작',
@@ -1282,19 +1305,24 @@ root.bind('<Escape>', stop_macro)
 
 # 단어 단어장 / 문장 단어장 전환 (왼쪽 위)
 study_kind = tk.StringVar(value='word')
+kind_buttons = {}
 frame_kind = tk.Frame(root)
 frame_kind.pack(anchor='w', padx=15, pady=(10, 0))
 for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
-  tk.Radiobutton(
+  _btn = tk.Radiobutton(
       frame_kind,
       text=_kind_text,
       value=_kind_value,
       variable=study_kind,
       indicatoron=0,
-      width=6,
-      font=('맑은 고딕', 9, 'bold'),
+      width=8,
+      bd=2,
+      pady=4,
+      font=('맑은 고딕', 10, 'bold'),
       command=lambda: on_kind_change(),
-  ).pack(side='left', padx=(0, 4))
+  )
+  _btn.pack(side='left', padx=(0, 6))
+  kind_buttons[_kind_value] = _btn
 
 lbl_status = tk.Label(
     root,
