@@ -64,7 +64,17 @@ def load_from_clipboard():
     data = json.loads(raw_text)
 
     if isinstance(data, list) and len(data) > 0 and 'eng' in data[0]:
-      word_list = data
+      # 문장 단어장은 북마크릿이 카드를 두 번씩 긁어온다(24문장 -> 48개).
+      # 중복이 있으면 같은 문장을 두 번 처리하려 하므로 순서를 지키면서
+      # 걸러낸다.
+      seen = set()
+      word_list = []
+      for item in data:
+        key = (item.get('eng', ''), item.get('kor', ''))
+        if key in seen:
+          continue
+        seen.add(key)
+        word_list.append(item)
       lbl_status.config(
           text=(
               f'준비 완료! 총 {len(word_list)}개 단어 로드됨\n모드에 맞는 버튼을'
@@ -186,6 +196,16 @@ def run_test_selenium():
   t.start()
 
 
+# --- 문장 암기(영작 연습) 자동 풀이 스레드 ---
+def run_sentence_memo():
+  if not word_list:
+    messagebox.showwarning('알림', '먼저 [불러오기]로 문장을 로드해주세요.')
+    return
+
+  t = threading.Thread(target=sentence_memo_worker, daemon=True)
+  t.start()
+
+
 def _strip_pos_tag(text):
   """'[명] 북극곰' 같은 한글 뜻 문자열에서 앞의 품사 태그를 떼고
   '북극곰'만 남긴다. 테스트 모드 보기 박스는 태그 없이 뜻만 표시하기
@@ -196,6 +216,38 @@ def _strip_pos_tag(text):
 def _norm_space(text):
   """앞뒤 공백을 없애고 중간 공백도 한 칸으로 통일한다."""
   return re.sub(r'\s+', ' ', text or '').strip()
+
+
+# 클래스카드 문장에는 일반 따옴표 대신 둥근 따옴표가 쓰인다(I’m). 화면
+# 텍스트와 비교할 때 서로 다른 글자로 취급되면 매칭이 통째로 실패한다.
+_QUOTE_MAP = {
+    '‘': "'",
+    '’': "'",
+    '“': '"',
+    '”': '"',
+}
+
+
+def _norm_quotes(text):
+  out = _norm_space(text)
+  for src, dst in _QUOTE_MAP.items():
+    out = out.replace(src, dst)
+  return out
+
+
+def _norm_token(text):
+  """문장 조각 비교용으로 낱말 하나를 정규화한다.
+
+  화면의 조각에는 문장부호가 빠져 있어서('Hi,' -> 'Hi') 양쪽 모두
+  부호를 떼고 소문자로 맞춘다. 아포스트로피는 낱말 안에 들어가므로
+  (I'm) 뗀 뒤 비교해도 되게 함께 제거한다."""
+  t = _norm_quotes(text).lower()
+  return re.sub(r"[^0-9a-zÀ-ɏ]+", '', t)
+
+
+def _sentence_tokens(sentence):
+  """영어 문장을 화면 조각과 같은 형태의 낱말 목록으로 쪼갠다."""
+  return [t for t in (_norm_token(w) for w in _norm_quotes(sentence).split()) if t]
 
 
 def _pick_choice(choices, target):
@@ -287,7 +339,7 @@ def dispatch_key(driver, key):
     pass
 
 
-_SECTION_DONE_JS = r"""
+_BUTTON_BY_TEXT_JS = r"""
 // 구간이 끝나면 "GOOD JOB!! / 구간 학습이 완료되었습니다" 화면이 뜨는데,
 // 여기엔 문제도 보기도 없어서 매크로가 그대로 멈춰 있었다. 화면에 보이는
 // [다음 구간으로 이동] 버튼을 찾아서 돌려준다. 텍스트가 정확히 일치하는
@@ -310,42 +362,51 @@ return null;
 """
 
 _SECTION_DONE_LABELS = ['다음 구간으로 이동', '다음 구간 이동', '계속하기']
+_WRITE_PRACTICE_LABELS = ['영작 연습하기']
 
 
-def handle_section_done(driver):
-  """구간 완료 화면이면 다음 구간으로 넘기고 True를 돌려준다.
-
-  버튼 클릭이 막히는 경우를 대비해 스페이스 입력도 함께 시도한다(화면에
-  SPACE 안내가 붙어 있다)."""
+def press_space(driver):
+  """스페이스를 보낸다. body를 먼저 클릭해 포커스를 다시 잡지 않으면
+  키가 그대로 사라진다."""
   try:
-    btn = driver.execute_script(_SECTION_DONE_JS, _SECTION_DONE_LABELS)
+    driver.find_element(By.TAG_NAME, 'body').click()
+    time.sleep(0.15)
+    ActionChains(driver).send_keys(Keys.SPACE).perform()
+    dispatch_key(driver, ' ')
+    return True
+  except Exception as e:
+    print('스페이스 입력 에러:', e)
+    return False
+
+
+def click_button_by_text(driver, labels, wait_after=1.2):
+  """화면에 labels 중 하나와 텍스트가 정확히 같은 버튼이 보이면 눌러서
+  True를 돌려준다. 클릭이 막히면 스페이스로 대체한다(이런 화면에는 항상
+  SPACE 안내가 같이 붙어 있다)."""
+  try:
+    btn = driver.execute_script(_BUTTON_BY_TEXT_JS, labels)
   except Exception:
     return False
 
   if not btn:
     return False
 
-  print('[DEBUG] 구간 완료 화면 감지 - 다음 구간으로 이동')
+  print(f'[DEBUG] 버튼 감지 - 클릭: {labels}')
   moved = False
   try:
     btn.click()
     moved = True
   except Exception:
-    pass
-
-  if not moved:
-    try:
-      driver.find_element(By.TAG_NAME, 'body').click()
-      time.sleep(0.15)
-      ActionChains(driver).send_keys(Keys.SPACE).perform()
-      dispatch_key(driver, ' ')
-      moved = True
-    except Exception as e:
-      print('구간 이동 에러:', e)
+    moved = press_space(driver)
 
   if moved:
-    time.sleep(1.2)  # 다음 구간 첫 화면이 뜰 때까지 잠시 대기
+    time.sleep(wait_after)  # 다음 화면이 뜰 때까지 잠시 대기
   return moved
+
+
+def handle_section_done(driver):
+  """구간 완료 화면이면 다음 구간으로 넘기고 True를 돌려준다."""
+  return click_button_by_text(driver, _SECTION_DONE_LABELS)
 
 
 def read_all_texts(driver, selector):
@@ -887,6 +948,226 @@ def test_worker():
     stop_macro()
 
 
+_SCRAMBLE_JS = r"""
+// 영작 연습 화면의 낱말 조각(.scramble-item)을 부모별로 묶어서 돌려준다.
+// 이 사이트는 지난/다음 카드가 DOM에 그대로 남는 일이 잦아서(단어 모드에서
+// 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
+// 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
+var nodes = document.querySelectorAll('.scramble-item');
+var parents = [];
+var groups = [];
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  if (typeof el.checkVisibility === 'function') {
+    try {
+      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
+        continue;
+      }
+    } catch (e) {}
+  }
+  var r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) continue;
+  var p = el.parentElement;
+  var idx = parents.indexOf(p);
+  if (idx === -1) {
+    parents.push(p);
+    groups.push([]);
+    idx = groups.length - 1;
+  }
+  groups[idx].push({el: el, text: (el.textContent || '').trim()});
+}
+return groups;
+"""
+
+
+def read_scramble_groups(driver):
+  """화면에 보이는 낱말 조각을 카드별로 묶어 [[(요소, 글자), ...], ...] 로."""
+  try:
+    raw = driver.execute_script(_SCRAMBLE_JS) or []
+  except Exception:
+    return []
+
+  groups = []
+  for group in raw:
+    items = [(d['el'], d['text']) for d in group if d.get('text')]
+    if items:
+      groups.append(items)
+  return groups
+
+
+def match_scramble_sentence(groups):
+  """조각 묶음 중에서 word_list의 문장 하나와 낱말 구성이 똑같은 것을 찾는다.
+
+  화면에 한글 뜻이 같이 떠 있긴 하지만, 조각만으로 어떤 문장인지 역산하면
+  한글 쪽 셀렉터에 의존하지 않아도 된다. (요소들, 문장, 정답 순서) 반환."""
+  for items in groups:
+    chips = [_norm_token(t) for _, t in items]
+    if not all(chips):
+      continue
+    chips_sorted = sorted(chips)
+    for word in word_list:
+      tokens = _sentence_tokens(word.get('eng', ''))
+      if len(tokens) == len(chips) and sorted(tokens) == chips_sorted:
+        return items, word, tokens
+  return None
+
+
+def click_scramble_in_order(driver, items, tokens):
+  """정답 순서대로 조각을 클릭한다.
+
+  'I ... I ...'처럼 같은 낱말이 두 번 나오는 문장이 있어서, 이미 누른
+  조각은 인덱스로 기억해두고 다음번엔 건너뛴다."""
+  used = set()
+  for tok in tokens:
+    if not is_running:
+      return False
+
+    target = None
+    for idx, (el, txt) in enumerate(items):
+      if idx in used or _norm_token(txt) != tok:
+        continue
+      target = (idx, el)
+      break
+
+    if target is None:
+      print(f"[DEBUG] '{tok}' 에 해당하는 조각을 못 찾음 - 이번 문장 건너뜀")
+      return False
+
+    idx, el = target
+    used.add(idx)
+    try:
+      el.click()
+    except StaleElementReferenceException:
+      print('[DEBUG] 조각이 사라짐(화면이 이미 넘어간 듯) - 이번 문장 중단')
+      return False
+    except Exception:
+      try:
+        driver.execute_script('arguments[0].click();', el)
+      except Exception as e:
+        print('조각 클릭 에러:', e)
+        return False
+    time.sleep(0.15)
+
+  return True
+
+
+# --- 문장 암기(영작 연습) 자동 풀이 스레드 ---
+def sentence_memo_worker():
+  global is_running, shared_driver
+  is_running = True
+
+  btn_load.config(state=tk.DISABLED)
+  btn_start.config(state=tk.DISABLED)
+  btn_recall_start.config(state=tk.DISABLED)
+  btn_spell_start.config(state=tk.DISABLED)
+  btn_test_start.config(state=tk.DISABLED)
+  btn_stop.config(state=tk.NORMAL)
+
+  try:
+    driver = get_driver()
+    root.after(
+        0,
+        lambda: lbl_status.config(
+            text='크롬에서 문장 암기(영작 연습) 화면으로 이동하세요.',
+            fg='#0288D1',
+        ),
+    )
+
+    solved_key = None
+    stuck = 0
+
+    while is_running:
+      groups = read_scramble_groups(driver)
+      matched = match_scramble_sentence(groups)
+
+      if not matched:
+        # 조각이 없는 화면: [영작 연습하기]로 문제를 열거나, 구간이 끝났으면
+        # 다음 구간으로 넘어간다.
+        if click_button_by_text(driver, _WRITE_PRACTICE_LABELS, wait_after=0.8):
+          continue
+        if handle_section_done(driver):
+          solved_key = None
+          continue
+        if groups:
+          print(f"[DEBUG] 조각은 보이는데 맞는 문장이 없음={[[t for _, t in g] for g in groups]}")
+        root.after(
+            0,
+            lambda: lbl_status.config(
+                text='문장 암기 화면을 기다리는 중...', fg='gray'
+            ),
+        )
+        time.sleep(0.3)
+        continue
+
+      items, word, tokens = matched
+      key = tuple(sorted(_norm_token(t) for _, t in items))
+
+      if key == solved_key:
+        # 방금 푼 화면이 아직 안 넘어갔다. 조각을 또 누르면 답이 망가지므로
+        # 스페이스만 다시 보낸다. 그래도 안 넘어가면 같은 문장이 또 나온
+        # 것으로 보고 다시 푼다.
+        stuck += 1
+        if stuck > 6:
+          print('[DEBUG] 같은 문장이 계속 떠서 다시 푼다')
+          solved_key = None
+          stuck = 0
+        else:
+          press_space(driver)
+          time.sleep(0.5)
+        continue
+
+      print(
+          f"[DEBUG] 조각들={[t for _, t in items]} -> 정답 문장='{word['eng']}'"
+      )
+      msg = f"문장 감지: {word['eng']}"
+      root.after(0, lambda m=msg: lbl_status.config(text=m, fg='#0288D1'))
+
+      done = click_scramble_in_order(driver, items, tokens)
+      print(f'[DEBUG] 배열성공={done}')
+
+      if done and is_running:
+        solved_key = key
+        stuck = 0
+        root.after(
+            0,
+            lambda t=word['eng']: lbl_status.config(
+                text=f"'{t}' 완성! 다음 문장 이동", fg='#388E3C'
+            ),
+        )
+        time.sleep(0.5)
+        press_space(driver)
+        time.sleep(0.8)
+      else:
+        time.sleep(0.5)
+
+  except Exception as e:
+    err_msg = str(e)
+    root.after(
+        0,
+        lambda: messagebox.showerror(
+            '셀레니움 에러', f'오류가 발생했습니다:\n{err_msg}'
+        ),
+    )
+  finally:
+    root.after(0, stop_macro)
+
+
+# --- 단어 / 문장 전환 ---
+def on_kind_change():
+  """왼쪽 위 [단어]/[문장] 선택에 따라 암기 버튼이 하는 일을 바꾼다.
+
+  리콜/스펠/테스트는 문장 단어장에서도 화면 구성이 같아서 그대로 쓴다.
+  암기만 완전히 다르다 - 단어는 카드 넘기기(PyAutoGUI), 문장은 낱말을
+  순서대로 클릭하는 영작 연습이다."""
+  is_sentence = study_kind.get() == 'sentence'
+  frame_memo.config(text=' 암기 (영작 연습) ' if is_sentence else ' 암기 ')
+  btn_start.config(
+      text='영작 연습 시작' if is_sentence else '암기 시작',
+      width=23 if is_sentence else 15,
+      command=run_sentence_memo if is_sentence else start_macro,
+  )
+
+
 def stop_macro(event=None):
   global is_running
   is_running = False
@@ -902,11 +1183,27 @@ def stop_macro(event=None):
 # --- UI 구성 ---
 root = tk.Tk()
 root.title('클래스카드 매크로')
-root.geometry('480x480')
+root.geometry('480x520')
 root.resizable(True, True)
 root.wm_attributes('-topmost', True)
 
 root.bind('<Escape>', stop_macro)
+
+# 단어 단어장 / 문장 단어장 전환 (왼쪽 위)
+study_kind = tk.StringVar(value='word')
+frame_kind = tk.Frame(root)
+frame_kind.pack(anchor='w', padx=15, pady=(10, 0))
+for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
+  tk.Radiobutton(
+      frame_kind,
+      text=_kind_text,
+      value=_kind_value,
+      variable=study_kind,
+      indicatoron=0,
+      width=6,
+      font=('맑은 고딕', 9, 'bold'),
+      command=lambda: on_kind_change(),
+  ).pack(side='left', padx=(0, 4))
 
 lbl_status = tk.Label(
     root,
@@ -916,7 +1213,7 @@ lbl_status = tk.Label(
     wraplength=460,
     justify='center',
 )
-lbl_status.pack(pady=(15, 10))
+lbl_status.pack(pady=(10, 10))
 
 # 공통 불러오기 버튼
 frame_top = tk.Frame(root)
@@ -1010,5 +1307,7 @@ btn_stop = tk.Button(
     state=tk.DISABLED,
 )
 btn_stop.pack(pady=(4, 12))
+
+on_kind_change()  # 시작 시 [단어] 기준으로 암기 버튼 맞춰두기
 
 root.mainloop()
