@@ -154,7 +154,7 @@ def memo_worker():
           root.after(
               0,
               lambda r=remain: lbl_status.config(
-                  text=f'암기 화면 확인! {r}초 후 시작합니다...', fg='#1976D2'
+                  text=f'{r}초후 시작', fg='#1976D2'
               ),
           )
           time.sleep(1)
