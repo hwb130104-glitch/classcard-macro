@@ -1214,7 +1214,7 @@ def click_scramble_in_order(driver, tokens):
       print(f"[DEBUG] '{tok}'({pos + 1}번째) 조각이 안 나타나 이번 문장 중단")
       return False
 
-    time.sleep(0.15)
+    time.sleep(0.07)
 
   return True
 
@@ -1259,7 +1259,7 @@ def sentence_memo_worker():
             print('[DEBUG] 영작 연습하기 화면 - 스페이스로 문제 열기')
             open_logged = True
           press_space(driver)
-          time.sleep(1.0)
+          time.sleep(0.55)
           continue
         open_logged = False
         if handle_section_done(driver):
@@ -1311,9 +1311,9 @@ def sentence_memo_worker():
                 text=f"'{t}' 완성! 다음 문장 이동", fg='#388E3C'
             ),
         )
-        time.sleep(0.5)
+        time.sleep(0.2)
         press_space(driver)
-        time.sleep(0.8)
+        time.sleep(0.45)
       else:
         time.sleep(0.5)
 
