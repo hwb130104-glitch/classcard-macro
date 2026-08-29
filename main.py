@@ -405,16 +405,24 @@ def on_memorize_screen(driver):
 
 
 _BUTTON_BY_TEXT_JS = r"""
-// 구간이 끝나면 "GOOD JOB!! / 구간 학습이 완료되었습니다" 화면이 뜨는데,
-// 여기엔 문제도 보기도 없어서 매크로가 그대로 멈춰 있었다. 화면에 보이는
-// [다음 구간으로 이동] 버튼을 찾아서 돌려준다. 텍스트가 정확히 일치하는
-// 것만 보므로, 이 문구를 품고 있는 바깥 div가 잘못 걸리지 않는다.
-var wanted = arguments[0];
+// 학습이 멈춰 서는 화면들(구간 완료 "GOOD JOB!!", 세트 완료 "100% Clear!!"
+// 등)에는 문제도 보기도 없어서 매크로가 그대로 멈춰 있었다. 화면에 보이는
+// 진행 버튼을 찾아서 돌려준다. 텍스트가 정확히 일치하거나 patterns 중
+// 하나와 맞는 것만 보므로, 같은 문구를 품고 있는 바깥 div는 안 걸린다.
+var wanted = arguments[0] || [];
+var patterns = arguments[1] || [];
 var nodes = document.querySelectorAll('a, button, input[type="button"], div, span, p');
 for (var i = 0; i < nodes.length; i++) {
   var el = nodes[i];
   var t = (el.textContent || el.value || '').replace(/\s+/g, ' ').trim();
-  if (wanted.indexOf(t) === -1) continue;
+  if (!t) continue;
+  var hit = wanted.indexOf(t) !== -1;
+  for (var k = 0; !hit && k < patterns.length; k++) {
+    try {
+      if (new RegExp(patterns[k]).test(t)) hit = true;
+    } catch (e) {}
+  }
+  if (!hit) continue;
   if (typeof el.checkVisibility === 'function') {
     try {
       if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
@@ -427,6 +435,9 @@ return null;
 """
 
 _SECTION_DONE_LABELS = ['다음 구간으로 이동', '다음 구간 이동', '계속하기']
+# 세트를 다 끝내면 "100% Clear!!" 화면에 [200% 도전]이 뜬다. 퍼센트는
+# 계속 올라가므로 숫자를 고정하지 않고 패턴으로 잡는다.
+_SECTION_DONE_PATTERNS = [r'^\d+% ?도전$']
 _WRITE_PRACTICE_LABELS = ['영작 연습하기']
 
 
@@ -444,12 +455,12 @@ def press_space(driver):
     return False
 
 
-def click_button_by_text(driver, labels, wait_after=1.2):
+def click_button_by_text(driver, labels, patterns=None, wait_after=1.2):
   """화면에 labels 중 하나와 텍스트가 정확히 같은 버튼이 보이면 눌러서
   True를 돌려준다. 클릭이 막히면 스페이스로 대체한다(이런 화면에는 항상
   SPACE 안내가 같이 붙어 있다)."""
   try:
-    btn = driver.execute_script(_BUTTON_BY_TEXT_JS, labels)
+    btn = driver.execute_script(_BUTTON_BY_TEXT_JS, labels, patterns or [])
   except Exception:
     return False
 
@@ -470,8 +481,10 @@ def click_button_by_text(driver, labels, wait_after=1.2):
 
 
 def handle_section_done(driver):
-  """구간 완료 화면이면 다음 구간으로 넘기고 True를 돌려준다."""
-  return click_button_by_text(driver, _SECTION_DONE_LABELS)
+  """구간/세트 완료 화면이면 다음으로 넘기고 True를 돌려준다."""
+  return click_button_by_text(
+      driver, _SECTION_DONE_LABELS, _SECTION_DONE_PATTERNS
+  )
 
 
 def read_all_texts(driver, selector):
