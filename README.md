@@ -78,9 +78,12 @@ python main.py
 
 1. PyInstaller로 실행 파일 빌드:
    ```bash
-   pyinstaller --onefile --windowed --name "암기" main.py
+   pyinstaller --onefile --windowed --name "암기" --collect-all selenium main.py
    ```
    빌드 결과물(`dist/암기.exe`)을 `setup.iss`와 같은 폴더로 복사합니다.
+   `--collect-all selenium`은 반드시 넣어야 합니다 — 빼면 selenium의 지연
+   임포트 모듈과 chromedriver를 받아오는 `selenium-manager.exe`가 빠져서,
+   빌드는 성공해도 실행 중에 selenium 에러가 납니다.
 2. [Inno Setup](https://jrsoftware.org/isinfo.php)으로 `setup.iss`를 열어 컴파일하면 `Classcard_Setup.exe` 설치 프로그램이 만들어집니다. (일반사용자는 X)
 
 ## 주의사항
