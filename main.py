@@ -128,13 +128,11 @@ def memo_worker():
       if handle_section_done(driver):
         continue
 
-      # 암기 카드가 실제로 떠 있을 때만 키를 보낸다. 로그인하고 학습
-      # 화면까지 들어가는 동안은 조용히 기다린다. 목록 화면에서는 카드가
-      # 한꺼번에 여러 개 잡히므로 개수로 걸러낸다.
-      shown = visible_card_words(driver)
-      if not shown or len(shown) > 3:
+      # 암기 학습 화면에 들어왔을 때만 키를 보낸다. 로그인하고 학습
+      # 화면까지 들어가는 동안은 조용히 기다린다.
+      if not on_memorize_screen(driver):
         if not waiting_logged:
-          print(f'[DEBUG] 암기 화면 대기 중 (카드에서 찾은 단어 {len(shown)}개)')
+          print('[DEBUG] 암기 화면 대기 중 (주소에 /Memorize/ 없음)')
           waiting_logged = True
         root.after(
             0,
@@ -146,7 +144,7 @@ def memo_worker():
         continue
 
       if waiting_logged:
-        print(f'[DEBUG] 암기 화면 감지: {sorted(shown)}')
+        print('[DEBUG] 암기 화면 감지 - 시작')
         waiting_logged = False
 
       try:
@@ -378,60 +376,21 @@ def dispatch_key(driver, key):
     pass
 
 
-_CURRENT_CARD_TEXTS_JS = r"""
-// 현재 카드(.flip-card 중 next/hidden이 붙지 않은 것)에 보이는 글자를 모은다.
-// 암기 화면에 실제로 들어왔는지 판단하는 용도다. 예전엔 버튼을 누르자마자
-// 키를 보내서, 로그인 화면에서 스페이스가 스크롤로 먹히고 있었다.
-var cards = document.querySelectorAll('.flip-card:not(.next):not(.hidden)');
-var out = [];
-for (var c = 0; c < cards.length && out.length < 200; c++) {
-  var card = cards[c];
-  if (typeof card.checkVisibility === 'function') {
-    try {
-      if (!card.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
-        continue;
-      }
-    } catch (e) {}
-  }
-  var r = card.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) continue;
-  var nodes = card.querySelectorAll('*');
-  for (var i = 0; i < nodes.length && out.length < 200; i++) {
-    var el = nodes[i];
-    if (el.children.length > 0) continue;  // 잎 요소만
-    var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-    if (t) out.push(t);
-  }
-}
-return out;
-"""
+# 이 사이트는 학습 종류가 주소에 그대로 드러난다.
+# 예) classcard.net/Memorize/21175530/1/1651515
+_MEMORIZE_URL_HINT = '/memorize/'
 
 
-def visible_card_words(driver):
-  """지금 화면의 카드에 떠 있는, 불러온 목록과 일치하는 단어들의 집합.
+def on_memorize_screen(driver):
+  """암기 학습 화면인지 URL로 판별한다.
 
-  화면 종류를 특정 셀렉터로 판별하는 대신 '내가 아는 단어가 카드에 떠
-  있는가'로 판단한다. 로그인/홈 화면에서는 아무것도 안 걸리고, 단어장
-  목록 화면에서는 수십 개가 한꺼번에 걸리므로 개수로 구분할 수 있다."""
+  처음엔 카드에 아는 단어가 떠 있는지로 판별하려 했는데, 암기 화면 카드는
+  .flip-card가 아니어서 하나도 못 찾고 계속 대기만 했다. 주소가 가장
+  확실하다."""
   try:
-    texts = driver.execute_script(_CURRENT_CARD_TEXTS_JS) or []
+    return _MEMORIZE_URL_HINT in (driver.current_url or '').lower()
   except Exception:
-    return set()
-
-  known = {}
-  for word in word_list:
-    for field in ('eng', 'kor'):
-      key = _norm_quotes(word.get(field, '')).lower()
-      if key:
-        known[key] = word.get('eng', '')
-
-  found = set()
-  for text in texts:
-    key = _norm_quotes(text).lower()
-    hit = known.get(key) or known.get(_strip_pos_tag(key))
-    if hit:
-      found.add(hit)
-  return found
+    return False
 
 
 _BUTTON_BY_TEXT_JS = r"""
