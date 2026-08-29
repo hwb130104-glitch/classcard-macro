@@ -287,6 +287,67 @@ def dispatch_key(driver, key):
     pass
 
 
+_SECTION_DONE_JS = r"""
+// 구간이 끝나면 "GOOD JOB!! / 구간 학습이 완료되었습니다" 화면이 뜨는데,
+// 여기엔 문제도 보기도 없어서 매크로가 그대로 멈춰 있었다. 화면에 보이는
+// [다음 구간으로 이동] 버튼을 찾아서 돌려준다. 텍스트가 정확히 일치하는
+// 것만 보므로, 이 문구를 품고 있는 바깥 div가 잘못 걸리지 않는다.
+var wanted = arguments[0];
+var nodes = document.querySelectorAll('a, button, input[type="button"], div, span, p');
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  var t = (el.textContent || el.value || '').replace(/\s+/g, ' ').trim();
+  if (wanted.indexOf(t) === -1) continue;
+  if (typeof el.checkVisibility === 'function') {
+    try {
+      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+    } catch (e) {}
+  }
+  var r = el.getBoundingClientRect();
+  if (r.width > 0 && r.height > 0) return el;
+}
+return null;
+"""
+
+_SECTION_DONE_LABELS = ['다음 구간으로 이동', '다음 구간 이동', '계속하기']
+
+
+def handle_section_done(driver):
+  """구간 완료 화면이면 다음 구간으로 넘기고 True를 돌려준다.
+
+  버튼 클릭이 막히는 경우를 대비해 스페이스 입력도 함께 시도한다(화면에
+  SPACE 안내가 붙어 있다)."""
+  try:
+    btn = driver.execute_script(_SECTION_DONE_JS, _SECTION_DONE_LABELS)
+  except Exception:
+    return False
+
+  if not btn:
+    return False
+
+  print('[DEBUG] 구간 완료 화면 감지 - 다음 구간으로 이동')
+  moved = False
+  try:
+    btn.click()
+    moved = True
+  except Exception:
+    pass
+
+  if not moved:
+    try:
+      driver.find_element(By.TAG_NAME, 'body').click()
+      time.sleep(0.15)
+      ActionChains(driver).send_keys(Keys.SPACE).perform()
+      dispatch_key(driver, ' ')
+      moved = True
+    except Exception as e:
+      print('구간 이동 에러:', e)
+
+  if moved:
+    time.sleep(1.2)  # 다음 구간 첫 화면이 뜰 때까지 잠시 대기
+  return moved
+
+
 def read_all_texts(driver, selector):
   """selector에 매칭되는 모든 요소의 textContent를 가시성 판단 없이 그대로
   반환한다. 일부 요소는 checkVisibility 기반 판정(read_visible)이 두 번째
@@ -445,6 +506,9 @@ def selenium_worker():
           )
           time.sleep(0.4)
       else:
+        # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
+        if handle_section_done(driver):
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
@@ -583,6 +647,9 @@ def spelling_worker():
           )
           time.sleep(0.4)
       else:
+        # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
+        if handle_section_done(driver):
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
@@ -795,6 +862,9 @@ def test_worker():
             seen_keys.add(current_cand_norm)
             fail_counts.pop(current_cand_norm, None)
       else:
+        # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
+        if handle_section_done(driver):
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
