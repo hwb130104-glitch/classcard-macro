@@ -455,15 +455,19 @@ def press_space(driver):
     return False
 
 
-def click_button_by_text(driver, labels, patterns=None, wait_after=1.2):
-  """화면에 labels 중 하나와 텍스트가 정확히 같은 버튼이 보이면 눌러서
-  True를 돌려준다. 클릭이 막히면 스페이스로 대체한다(이런 화면에는 항상
-  SPACE 안내가 같이 붙어 있다)."""
+def find_button_by_text(driver, labels, patterns=None):
+  """labels 중 하나와 텍스트가 정확히 같거나 patterns에 맞는, 화면에
+  보이는 요소를 돌려준다. 없으면 None."""
   try:
-    btn = driver.execute_script(_BUTTON_BY_TEXT_JS, labels, patterns or [])
+    return driver.execute_script(_BUTTON_BY_TEXT_JS, labels, patterns or [])
   except Exception:
-    return False
+    return None
 
+
+def click_button_by_text(driver, labels, patterns=None, wait_after=1.2):
+  """해당 버튼이 보이면 눌러서 True를 돌려준다. 클릭이 막히면 스페이스로
+  대체한다(이런 화면에는 항상 SPACE 안내가 같이 붙어 있다)."""
+  btn = find_button_by_text(driver, labels, patterns)
   if not btn:
     return False
 
@@ -1153,6 +1157,7 @@ def sentence_memo_worker():
 
     solved_key = None
     stuck = 0
+    open_logged = False
 
     while is_running:
       groups = read_scramble_groups(driver)
@@ -1161,8 +1166,16 @@ def sentence_memo_worker():
       if not matched:
         # 조각이 없는 화면: [영작 연습하기]로 문제를 열거나, 구간이 끝났으면
         # 다음 구간으로 넘어간다.
-        if click_button_by_text(driver, _WRITE_PRACTICE_LABELS, wait_after=0.8):
+        # [영작 연습하기] 화면. 셀레니움 클릭은 먹히지 않아서(눌러도 화면이
+        # 그대로였다) 화면 안내대로 스페이스를 보낸다.
+        if find_button_by_text(driver, _WRITE_PRACTICE_LABELS):
+          if not open_logged:
+            print('[DEBUG] 영작 연습하기 화면 - 스페이스로 문제 열기')
+            open_logged = True
+          press_space(driver)
+          time.sleep(1.0)
           continue
+        open_logged = False
         if handle_section_done(driver):
           solved_key = None
           continue
