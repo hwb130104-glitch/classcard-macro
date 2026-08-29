@@ -1040,9 +1040,9 @@ _SCRAMBLE_JS = r"""
 // 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
 // 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
 // 긴 문장은 조각이 한 줄에 안 들어가 뒷부분이 '...'로 잘려 보인다. 잘린
-// 조각도 DOM에는 있으므로 전부 돌려주되, 하나하나 화면에 보이는지(vis)를
-// 같이 넘긴다. 파이썬 쪽에서 '한 조각도 안 보이는 카드'는 지난 카드로 보고
-// 버리고, 남은 카드는 잘린 조각까지 다 세어 몇 낱말이 남았는지 계산한다.
+// 조각도 DOM에는 있으므로 전부 돌려주되, 보이는지(vis) / 누를 수 있는지(clk)
+// / 화면 위치(top)를 같이 넘긴다. 이미 문장에 놓인 낱말도 같은 클래스라서
+// 아래 조각 묶음과 구분해야 하는데, 이 셋으로 파이썬 쪽에서 걸러낸다.
 var nodes = document.querySelectorAll('.scramble-item, .btn-scramble');
 var parents = [];
 var groups = [];
@@ -1063,7 +1063,13 @@ for (var i = 0; i < nodes.length; i++) {
     groups.push([]);
     idx = groups.length - 1;
   }
-  groups[idx].push({el: el, text: (el.textContent || '').trim(), vis: vis});
+  groups[idx].push({
+    el: el,
+    text: (el.textContent || '').trim(),
+    vis: vis,
+    clk: el.classList.contains('clickable'),
+    top: r.top
+  });
 }
 return groups;
 """
@@ -1081,14 +1087,31 @@ def read_scramble_groups(driver):
   except Exception:
     return []
 
-  groups = []
+  usable = []
   for group in raw:
     if not any(d.get('vis') for d in group):
       continue
     items = [(d['el'], d['text']) for d in group if d.get('text')]
-    if items:
-      groups.append(items)
-  return groups
+    if not items:
+      continue
+    tops = [d.get('top') or 0 for d in group]
+    usable.append({
+        'items': items,
+        'clickable': all(d.get('clk') for d in group),
+        'top': sum(tops) / len(tops),
+    })
+
+  if not usable:
+    return []
+
+  # 이미 문장에 놓인 낱말도 같은 클래스를 달고 있어서, 그쪽을 남은 조각으로
+  # 착각하면 문장을 중간까지만 배열하고 끝난다. 누를 수 있는(clickable) 묶음이
+  # 있으면 그것만 쓰고, 그래도 여럿이면 화면 아래쪽(조각 트레이)을 먼저 본다.
+  clickable = [g for g in usable if g['clickable']]
+  if clickable:
+    usable = clickable
+  usable.sort(key=lambda g: -g['top'])
+  return [g['items'] for g in usable]
 
 
 def _is_submultiset(chips, tokens):
@@ -1119,14 +1142,13 @@ def match_scramble_sentence(groups):
 
   화면에 한글 뜻이 같이 떠 있긴 하지만, 조각만으로 역산하면 한글 쪽
   셀렉터에 의존하지 않아도 된다."""
-  best = None
-  best_tie = False
-
-  for items in groups:
-    usable = _usable_items(items)
-    if not usable:
-      continue
+  # 첫 묶음(= 아직 안 누른 조각들)만 본다. 이미 문장에 놓인 낱말 묶음까지
+  # 같이 보면, 'My' 하나로 여러 문장이 후보가 되면서 판단을 망친다.
+  usable = _usable_items(groups[0]) if groups else []
+  if usable:
     chips = [_norm_token(t) for _, t in usable]
+    best = None
+    best_tie = False
 
     for word in word_list:
       tokens = _sentence_tokens(word.get('eng', ''))
@@ -1137,34 +1159,36 @@ def match_scramble_sentence(groups):
 
       extra = len(tokens) - len(chips)
       if best is None or extra < best[0]:
-        best = (extra, usable, word, tokens)
+        best = (extra, word, tokens)
         best_tie = False
-      elif extra == best[0] and word.get('eng') != best[2].get('eng'):
+      elif extra == best[0] and word.get('eng') != best[1].get('eng'):
         best_tie = True
 
-  if best is None:
-    return None
-  if best_tie:
-    print(f'[DEBUG] 조각만으로 문장을 특정할 수 없어 건너뜀 (남는 낱말 {best[0]}개)')
-    return None
+    if best is None:
+      return None
+    if best_tie:
+      print(f'[DEBUG] 조각만으로 문장을 특정할 수 없어 건너뜀 (남는 낱말 {best[0]}개)')
+      return None
 
-  _, usable, word, tokens = best
-  return usable, word, tokens
+    _, word, tokens = best
+    return usable, word, tokens
+
+  return None
 
 
 def _pick_group_for(groups, tokens):
-  """다시 읽은 조각 묶음 중 지금 풀고 있는 문장의 것을 고른다.
+  """조각 묶음 중 '아직 안 누른 조각들'이 담긴 묶음을 고른다.
 
-  카드가 DOM에 여러 개 남아 있을 수 있으므로, 문장 낱말과 겹치는 조각이
-  가장 많은 묶음을 현재 카드로 본다."""
-  best_items, best_hits = [], 0
+  read_scramble_groups가 이미 누를 수 있는 묶음만, 화면 아래쪽부터 정렬해
+  돌려주므로, 문장 낱말과 겹치는 게 하나라도 있는 첫 묶음을 쓴다. 겹치는
+  개수가 가장 많은 것을 고르면 안 된다 - 이미 문장에 놓인 낱말이 더 많이
+  쌓여 있으면 그쪽이 뽑혀서 같은 낱말을 또 누르게 된다."""
   wanted = set(tokens)
   for items in groups:
     usable = _usable_items(items)
-    hits = sum(1 for _, txt in usable if _norm_token(txt) in wanted)
-    if hits > best_hits:
-      best_items, best_hits = usable, hits
-  return best_items
+    if any(_norm_token(txt) in wanted for _, txt in usable):
+      return usable
+  return []
 
 
 def _next_token_index(tokens, chips):
@@ -1199,6 +1223,8 @@ def click_scramble_in_order(driver, tokens):
   자바스크립트로 한다(잘린 요소는 일반 클릭이 막힌다). 이미 누른 조각은
   따로 기억해 다시 누르지 않는다."""
   used = []
+  needed = None  # 이번 문장에서 눌러야 할 조각 수 (처음 읽을 때 정해진다)
+  done_count = 0
 
   for step in range(len(tokens) * 2 + 4):
     if not is_running:
@@ -1224,6 +1250,12 @@ def click_scramble_in_order(driver, tokens):
       return True  # 더 놓을 조각이 없으면 문장을 다 배열한 것
 
     chips = [_norm_token(txt) for _, txt in items]
+    if needed is None:
+      # 처음 본 조각 수가 곧 눌러야 할 횟수다. 다 누르고 나면 문장 줄에
+      # 놓인 낱말들만 남는데(그것도 같은 클래스라 다시 잡힌다) 거기서
+      # 멈추지 않으면 이미 놓은 낱말을 또 눌러 답을 망가뜨린다.
+      needed = len(chips)
+
     k = _next_token_index(tokens, chips)
     if k is None or k >= len(tokens):
       print(f'[DEBUG] 남은 조각 {chips} 이 문장과 안 맞아 중단')
@@ -1253,6 +1285,9 @@ def click_scramble_in_order(driver, tokens):
         return False
 
     used.append(target)
+    done_count += 1
+    if done_count >= needed:
+      return True
     time.sleep(0.07)
 
   print('[DEBUG] 조각을 다 못 눌러서 중단')
