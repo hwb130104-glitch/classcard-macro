@@ -113,17 +113,41 @@ def memo_worker():
     root.after(
         0,
         lambda: lbl_status.config(
-            text='크롬에서 암기 학습 화면으로 이동하세요.', fg='#0288D1'
+            text=('크롬에서 로그인 후 암기 학습 화면으로 이동하세요.\n'
+                  '화면이 뜨면 자동으로 시작합니다.'),
+            fg='#0288D1',
         ),
     )
 
     total = len(word_list)
     idx = 0
+    waiting_logged = False
 
     while is_running and idx < total:
       # 구간이 끝나 완료 화면이 떠 있으면 먼저 다음 구간으로 넘긴다.
       if handle_section_done(driver):
         continue
+
+      # 암기 카드가 실제로 떠 있을 때만 키를 보낸다. 로그인하고 학습
+      # 화면까지 들어가는 동안은 조용히 기다린다. 목록 화면에서는 카드가
+      # 한꺼번에 여러 개 잡히므로 개수로 걸러낸다.
+      shown = visible_card_words(driver)
+      if not shown or len(shown) > 3:
+        if not waiting_logged:
+          print(f'[DEBUG] 암기 화면 대기 중 (카드에서 찾은 단어 {len(shown)}개)')
+          waiting_logged = True
+        root.after(
+            0,
+            lambda: lbl_status.config(
+                text='암기 학습 화면을 기다리는 중...', fg='gray'
+            ),
+        )
+        time.sleep(0.5)
+        continue
+
+      if waiting_logged:
+        print(f'[DEBUG] 암기 화면 감지: {sorted(shown)}')
+        waiting_logged = False
 
       try:
         driver.find_element(By.TAG_NAME, 'body').click()
@@ -352,6 +376,62 @@ def dispatch_key(driver, key):
     driver.execute_script(_DISPATCH_KEY_JS, key)
   except Exception:
     pass
+
+
+_CURRENT_CARD_TEXTS_JS = r"""
+// 현재 카드(.flip-card 중 next/hidden이 붙지 않은 것)에 보이는 글자를 모은다.
+// 암기 화면에 실제로 들어왔는지 판단하는 용도다. 예전엔 버튼을 누르자마자
+// 키를 보내서, 로그인 화면에서 스페이스가 스크롤로 먹히고 있었다.
+var cards = document.querySelectorAll('.flip-card:not(.next):not(.hidden)');
+var out = [];
+for (var c = 0; c < cards.length && out.length < 200; c++) {
+  var card = cards[c];
+  if (typeof card.checkVisibility === 'function') {
+    try {
+      if (!card.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
+        continue;
+      }
+    } catch (e) {}
+  }
+  var r = card.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) continue;
+  var nodes = card.querySelectorAll('*');
+  for (var i = 0; i < nodes.length && out.length < 200; i++) {
+    var el = nodes[i];
+    if (el.children.length > 0) continue;  // 잎 요소만
+    var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (t) out.push(t);
+  }
+}
+return out;
+"""
+
+
+def visible_card_words(driver):
+  """지금 화면의 카드에 떠 있는, 불러온 목록과 일치하는 단어들의 집합.
+
+  화면 종류를 특정 셀렉터로 판별하는 대신 '내가 아는 단어가 카드에 떠
+  있는가'로 판단한다. 로그인/홈 화면에서는 아무것도 안 걸리고, 단어장
+  목록 화면에서는 수십 개가 한꺼번에 걸리므로 개수로 구분할 수 있다."""
+  try:
+    texts = driver.execute_script(_CURRENT_CARD_TEXTS_JS) or []
+  except Exception:
+    return set()
+
+  known = {}
+  for word in word_list:
+    for field in ('eng', 'kor'):
+      key = _norm_quotes(word.get(field, '')).lower()
+      if key:
+        known[key] = word.get('eng', '')
+
+  found = set()
+  for text in texts:
+    key = _norm_quotes(text).lower()
+    hit = known.get(key) or known.get(_strip_pos_tag(key))
+    if hit:
+      found.add(hit)
+  return found
 
 
 _BUTTON_BY_TEXT_JS = r"""
