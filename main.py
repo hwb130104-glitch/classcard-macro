@@ -1199,15 +1199,14 @@ def _next_token_index(tokens, chips):
   그게 다음에 눌러야 할 자리다. 예: 13낱말 문장에서 조각이
   [the, fresh, air, there]면 9번째부터 남은 것이므로 tokens[9]를 누른다.
 
-  잘린 조각까지 다 읽으면 남은 낱말과 개수가 정확히 맞으므로 그 지점이
-  확실하다. 혹시 일부만 잡혔을 때를 대비해, 안 맞으면 조각을 전부 포함하는
-  가장 늦은 지점으로 대신한다."""
+  조각을 다 읽었다면 남은 낱말과 개수가 정확히 맞고, 그 지점이 답이다.
+  개수가 안 맞으면(조각 일부가 아직 DOM에 없는 경우) 어디부터인지 확신할 수
+  없다. 예전엔 '조각을 전부 포함하는 가장 늦은 지점'으로 때웠는데, 같은
+  낱말이 두 번 나오는 문장에서 엉뚱한 자리를 골라 틀린 답을 제출했다.
+  확신이 없으면 None을 돌려주고 건드리지 않는다."""
   k0 = len(tokens) - len(chips)
   if k0 >= 0 and sorted(tokens[k0:]) == sorted(chips):
     return k0
-  for k in range(k0, -1, -1):
-    if _is_submultiset(chips, tokens[k:]):
-      return k
   return None
 
 
@@ -1260,7 +1259,10 @@ def click_scramble_in_order(driver, tokens):
 
     k = _next_token_index(tokens, chips)
     if k is None or k >= len(tokens):
-      print(f'[DEBUG] 남은 조각 {chips} 이 문장과 안 맞아 중단')
+      print(
+          f'[DEBUG] 조각 {len(chips)}개가 남은 낱말과 안 맞아 중단'
+          f' (조각={chips})'
+      )
       return False
 
     tok = tokens[k]
