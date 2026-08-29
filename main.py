@@ -1035,12 +1035,16 @@ _SCRAMBLE_JS = r"""
 // 이 사이트는 지난/다음 카드가 DOM에 그대로 남는 일이 잦아서(단어 모드에서
 // 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
 // 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
+// 긴 문장은 조각이 한 줄에 안 들어가 뒷부분이 '...'로 잘려 보인다. 잘린
+// 조각도 DOM에는 있으므로, 필요한 낱말을 화면에서 못 찾으면 includeHidden으로
+// 다시 읽는다.
+var includeHidden = arguments[0];
 var nodes = document.querySelectorAll('.scramble-item');
 var parents = [];
 var groups = [];
 for (var i = 0; i < nodes.length; i++) {
   var el = nodes[i];
-  if (typeof el.checkVisibility === 'function') {
+  if (!includeHidden && typeof el.checkVisibility === 'function') {
     try {
       if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
         continue;
@@ -1048,7 +1052,7 @@ for (var i = 0; i < nodes.length; i++) {
     } catch (e) {}
   }
   var r = el.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) continue;
+  if (!includeHidden && (r.width <= 0 || r.height <= 0)) continue;
   var p = el.parentElement;
   var idx = parents.indexOf(p);
   if (idx === -1) {
@@ -1062,10 +1066,12 @@ return groups;
 """
 
 
-def read_scramble_groups(driver):
-  """화면에 보이는 낱말 조각을 카드별로 묶어 [[(요소, 글자), ...], ...] 로."""
+def read_scramble_groups(driver, include_hidden=False):
+  """낱말 조각을 카드별로 묶어 [[(요소, 글자), ...], ...] 로 돌려준다.
+
+  include_hidden=True면 '...'로 잘려 화면에 안 보이는 조각까지 포함한다."""
   try:
-    raw = driver.execute_script(_SCRAMBLE_JS) or []
+    raw = driver.execute_script(_SCRAMBLE_JS, bool(include_hidden)) or []
   except Exception:
     return []
 
@@ -1077,57 +1083,137 @@ def read_scramble_groups(driver):
   return groups
 
 
-def match_scramble_sentence(groups):
-  """조각 묶음 중에서 word_list의 문장 하나와 낱말 구성이 똑같은 것을 찾는다.
+def _is_submultiset(chips, tokens):
+  """chips의 낱말이 tokens 안에 (개수까지 포함해) 전부 들어있는지."""
+  pool = list(tokens)
+  for chip in chips:
+    if chip in pool:
+      pool.remove(chip)
+    else:
+      return False
+  return True
 
-  화면에 한글 뜻이 같이 떠 있긴 하지만, 조각만으로 어떤 문장인지 역산하면
-  한글 쪽 셀렉터에 의존하지 않아도 된다. (요소들, 문장, 정답 순서) 반환."""
+
+def _usable_items(items):
+  """조각 중 실제 낱말인 것만 남긴다. 긴 문장에서는 '...' 표시가 조각처럼
+  같이 잡히는데, 정규화하면 빈 문자열이 되므로 걸러낸다."""
+  return [(el, txt) for el, txt in items if _norm_token(txt)]
+
+
+def match_scramble_sentence(groups):
+  """조각을 보고 어떤 문장인지 역산한다. (요소들, 문장, 정답 순서) 반환.
+
+  긴 문장은 조각을 앞부분만 보여주고 나머지는 '...'로 감춘다. 그래서
+  '조각 구성 == 문장 전체'로 보면 긴 문장은 아예 매칭이 안 됐다. 보이는
+  조각이 문장 낱말의 부분집합인지로 판단하고, 후보가 여럿이면 남는 낱말이
+  가장 적은 쪽을 고른다. 그래도 동점이면 어느 문장인지 확신할 수 없으므로
+  건드리지 않는다.
+
+  화면에 한글 뜻이 같이 떠 있긴 하지만, 조각만으로 역산하면 한글 쪽
+  셀렉터에 의존하지 않아도 된다."""
+  best = None
+  best_tie = False
+
   for items in groups:
-    chips = [_norm_token(t) for _, t in items]
-    if not all(chips):
+    usable = _usable_items(items)
+    if not usable:
       continue
-    chips_sorted = sorted(chips)
+    chips = [_norm_token(t) for _, t in usable]
+
     for word in word_list:
       tokens = _sentence_tokens(word.get('eng', ''))
-      if len(tokens) == len(chips) and sorted(tokens) == chips_sorted:
-        return items, word, tokens
-  return None
+      if not tokens or len(chips) > len(tokens):
+        continue
+      if not _is_submultiset(chips, tokens):
+        continue
+
+      extra = len(tokens) - len(chips)
+      if best is None or extra < best[0]:
+        best = (extra, usable, word, tokens)
+        best_tie = False
+      elif extra == best[0] and word.get('eng') != best[2].get('eng'):
+        best_tie = True
+
+  if best is None:
+    return None
+  if best_tie:
+    print(f'[DEBUG] 조각만으로 문장을 특정할 수 없어 건너뜀 (남는 낱말 {best[0]}개)')
+    return None
+
+  _, usable, word, tokens = best
+  return usable, word, tokens
 
 
-def click_scramble_in_order(driver, items, tokens):
+def _pick_group_for(groups, tokens):
+  """다시 읽은 조각 묶음 중 지금 풀고 있는 문장의 것을 고른다.
+
+  카드가 DOM에 여러 개 남아 있을 수 있으므로, 문장 낱말과 겹치는 조각이
+  가장 많은 묶음을 현재 카드로 본다."""
+  best_items, best_hits = [], 0
+  wanted = set(tokens)
+  for items in groups:
+    usable = _usable_items(items)
+    hits = sum(1 for _, txt in usable if _norm_token(txt) in wanted)
+    if hits > best_hits:
+      best_items, best_hits = usable, hits
+  return best_items
+
+
+def click_scramble_in_order(driver, tokens):
   """정답 순서대로 조각을 클릭한다.
 
-  'I ... I ...'처럼 같은 낱말이 두 번 나오는 문장이 있어서, 이미 누른
-  조각은 인덱스로 기억해두고 다음번엔 건너뛴다."""
-  used = set()
-  for tok in tokens:
-    if not is_running:
-      return False
+  긴 문장은 앞 조각을 눌러야 뒤 조각이 자리로 들어오므로, 낱말마다 화면을
+  다시 읽는다. 1초 동안 화면에서 못 찾으면 잘려서 안 보이는 조각까지
+  뒤진다. 'I ... I ...'처럼 같은 낱말이 두 번 나오는 문장이 있어서 이미
+  누른 조각은 따로 기억해두고 건너뛴다."""
+  used = []
 
-    target = None
-    for idx, (el, txt) in enumerate(items):
-      if idx in used or _norm_token(txt) != tok:
-        continue
-      target = (idx, el)
-      break
+  for pos, tok in enumerate(tokens):
+    clicked = False
 
-    if target is None:
-      print(f"[DEBUG] '{tok}' 에 해당하는 조각을 못 찾음 - 이번 문장 건너뜀")
-      return False
-
-    idx, el = target
-    used.add(idx)
-    try:
-      el.click()
-    except StaleElementReferenceException:
-      print('[DEBUG] 조각이 사라짐(화면이 이미 넘어간 듯) - 이번 문장 중단')
-      return False
-    except Exception:
-      try:
-        driver.execute_script('arguments[0].click();', el)
-      except Exception as e:
-        print('조각 클릭 에러:', e)
+    for attempt in range(20):  # 조각이 나타날 때까지 최대 2초
+      if not is_running:
         return False
+
+      # 화면에 보이는 조각부터 찾고, 없으면 잘려서 안 보이는 조각까지 뒤진다.
+      for include_hidden in (False, True):
+        groups = read_scramble_groups(driver, include_hidden=include_hidden)
+        items = _pick_group_for(groups, tokens)
+
+        for el, txt in items:
+          if _norm_token(txt) != tok:
+            continue
+          if any(el == prev for prev in used):
+            continue
+          try:
+            if include_hidden:
+              # 잘린 조각은 셀레니움 클릭이 막히므로 JS로 누른다.
+              driver.execute_script('arguments[0].click();', el)
+            else:
+              el.click()
+          except StaleElementReferenceException:
+            continue
+          except Exception:
+            try:
+              driver.execute_script('arguments[0].click();', el)
+            except Exception as e:
+              print('조각 클릭 에러:', e)
+              return False
+          used.append(el)
+          clicked = True
+          break
+
+        if clicked:
+          break
+
+      if clicked:
+        break
+      time.sleep(0.1)
+
+    if not clicked:
+      print(f"[DEBUG] '{tok}'({pos + 1}번째) 조각이 안 나타나 이번 문장 중단")
+      return False
+
     time.sleep(0.15)
 
   return True
@@ -1213,7 +1299,7 @@ def sentence_memo_worker():
       msg = f"문장 감지: {word['eng']}"
       root.after(0, lambda m=msg: lbl_status.config(text=m, fg='#0288D1'))
 
-      done = click_scramble_in_order(driver, items, tokens)
+      done = click_scramble_in_order(driver, tokens)
       print(f'[DEBUG] 배열성공={done}')
 
       if done and is_running:
