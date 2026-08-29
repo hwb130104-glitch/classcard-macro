@@ -244,13 +244,16 @@ def run_test_selenium():
   t.start()
 
 
-# --- 문장 암기(영작 연습) 자동 풀이 스레드 ---
-def run_sentence_memo():
+# --- 문장 낱말 배열 자동 풀이 스레드 ---
+# 문장 단어장은 암기(영작 연습)도, 리콜(듣고 배열하기)도 낱말 조각을 순서대로
+# 누르는 방식이라 같은 워커를 쓴다. 리콜은 문제가 소리로만 나오지만, 조각
+# 구성만 보면 어떤 문장인지 알 수 있어서 들을 필요가 없다.
+def run_sentence_scramble():
   if not word_list:
     messagebox.showwarning('알림', '먼저 [불러오기]로 문장을 로드해주세요.')
     return
 
-  t = threading.Thread(target=sentence_memo_worker, daemon=True)
+  t = threading.Thread(target=sentence_scramble_worker, daemon=True)
   t.start()
 
 
@@ -1031,7 +1034,8 @@ def test_worker():
 
 
 _SCRAMBLE_JS = r"""
-// 영작 연습 화면의 낱말 조각(.scramble-item)을 부모별로 묶어서 돌려준다.
+// 낱말 조각을 부모별로 묶어서 돌려준다. 클래스가 화면마다 다르다 -
+// 암기(영작 연습)는 .scramble-item, 리콜(듣고 배열)은 .btn-scramble이다.
 // 이 사이트는 지난/다음 카드가 DOM에 그대로 남는 일이 잦아서(단어 모드에서
 // 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
 // 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
@@ -1039,7 +1043,7 @@ _SCRAMBLE_JS = r"""
 // 조각도 DOM에는 있으므로, 필요한 낱말을 화면에서 못 찾으면 includeHidden으로
 // 다시 읽는다.
 var includeHidden = arguments[0];
-var nodes = document.querySelectorAll('.scramble-item');
+var nodes = document.querySelectorAll('.scramble-item, .btn-scramble');
 var parents = [];
 var groups = [];
 for (var i = 0; i < nodes.length; i++) {
@@ -1163,12 +1167,46 @@ def click_scramble_in_order(driver, tokens):
   """정답 순서대로 조각을 클릭한다.
 
   긴 문장은 앞 조각을 눌러야 뒤 조각이 자리로 들어오므로, 낱말마다 화면을
-  다시 읽는다. 1초 동안 화면에서 못 찾으면 잘려서 안 보이는 조각까지
-  뒤진다. 'I ... I ...'처럼 같은 낱말이 두 번 나오는 문장이 있어서 이미
-  누른 조각은 따로 기억해두고 건너뛴다."""
+  다시 읽는다. 화면에서 못 찾으면 잘려서 안 보이는 조각까지 뒤진다.
+  'I ... I ...'처럼 같은 낱말이 두 번 나오는 문장이 있어서 이미 누른 조각은
+  따로 기억해두고 건너뛴다.
+
+  리콜(듣고 배열)은 첫 낱말을 미리 채워둔 채로 시작한다. 그 낱말은 조각이
+  아예 없으므로, 시작할 때 조각 전체를 훑어서 눌러야 할 낱말만 추린다."""
+  todo = tokens
+  pool = [
+      _norm_token(txt)
+      for _, txt in _pick_group_for(
+          read_scramble_groups(driver, include_hidden=True), tokens
+      )
+  ]
+  if pool:
+    # 부족한 낱말은 '앞에서부터' 건너뛴다. 미리 채워지는 건 문장 앞부분이라
+    # 'I ... I ...'처럼 같은 낱말이 두 번 나올 때 뒤쪽을 건너뛰면 순서가
+    # 통째로 어긋난다.
+    need, have = {}, {}
+    for tok in tokens:
+      need[tok] = need.get(tok, 0) + 1
+    for tok in pool:
+      have[tok] = have.get(tok, 0) + 1
+    to_skip = {t: max(0, n - have.get(t, 0)) for t, n in need.items()}
+
+    todo, skipped = [], []
+    for tok in tokens:
+      if to_skip.get(tok, 0) > 0:
+        to_skip[tok] -= 1
+        skipped.append(tok)
+      else:
+        todo.append(tok)
+
+    if skipped:
+      print(f'[DEBUG] 이미 놓여 있어 건너뛴 낱말={skipped}')
+    if not todo:
+      return False
+
   used = []
 
-  for pos, tok in enumerate(tokens):
+  for pos, tok in enumerate(todo):
     clicked = False
 
     for attempt in range(20):  # 조각이 나타날 때까지 최대 2초
@@ -1220,7 +1258,7 @@ def click_scramble_in_order(driver, tokens):
 
 
 # --- 문장 암기(영작 연습) 자동 풀이 스레드 ---
-def sentence_memo_worker():
+def sentence_scramble_worker():
   global is_running, shared_driver
   is_running = True
 
@@ -1236,7 +1274,7 @@ def sentence_memo_worker():
     root.after(
         0,
         lambda: lbl_status.config(
-            text='크롬에서 문장 암기(영작 연습) 화면으로 이동하세요.',
+            text='크롬에서 문장 학습 화면으로 이동하세요.',
             fg='#0288D1',
         ),
     )
@@ -1270,7 +1308,7 @@ def sentence_memo_worker():
         root.after(
             0,
             lambda: lbl_status.config(
-                text='문장 암기 화면을 기다리는 중...', fg='gray'
+                text='문장 학습 화면을 기다리는 중...', fg='gray'
             ),
         )
         time.sleep(0.3)
@@ -1364,7 +1402,14 @@ def on_kind_change():
   btn_start.config(
       text='영작 연습 시작' if is_sentence else '암기 시작',
       width=23 if is_sentence else 15,
-      command=run_sentence_memo if is_sentence else start_macro,
+      command=run_sentence_scramble if is_sentence else start_macro,
+  )
+
+  # 문장 리콜은 듣고 낱말을 배열하는 방식이라 영작 연습과 화면 구조가 같다.
+  frame_recall.config(text=' 리콜 (듣고 배열) ' if is_sentence else ' 리콜 ')
+  btn_recall_start.config(
+      text='리콜 자동 풀이 시작',
+      command=run_sentence_scramble if is_sentence else run_recall_selenium,
   )
 
 
