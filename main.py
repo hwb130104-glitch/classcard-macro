@@ -444,6 +444,32 @@ _SECTION_DONE_PATTERNS = [r'^\d+% ?도전$']
 _WRITE_PRACTICE_LABELS = ['영작 연습하기']
 
 
+_CLASS_TEST_URL_HINT = '/classtest/'
+
+
+def press_submit(driver):
+  """배열을 마친 뒤 제출한다.
+
+  암기/리콜/스펠은 스페이스로 넘어가지만, 테스트(어순배열)는 [제출] 버튼에
+  ENTER가 붙어 있다. 주소로 구분한다."""
+  try:
+    is_test = _CLASS_TEST_URL_HINT in (driver.current_url or '').lower()
+  except Exception:
+    is_test = False
+
+  if not is_test:
+    return press_space(driver)
+
+  try:
+    driver.find_element(By.TAG_NAME, 'body').click()
+    time.sleep(0.1)
+    ActionChains(driver).send_keys(Keys.RETURN).perform()
+    return True
+  except Exception as e:
+    print('제출 입력 에러:', e)
+    return False
+
+
 def press_space(driver):
   """스페이스를 보낸다. body를 먼저 클릭해 포커스를 다시 잡지 않으면
   키가 그대로 사라진다."""
@@ -1034,8 +1060,10 @@ def test_worker():
 
 
 _SCRAMBLE_JS = r"""
-// 낱말 조각을 부모별로 묶어서 돌려준다. 클래스가 화면마다 다르다 -
-// 암기(영작 연습)는 .scramble-item, 리콜(듣고 배열)은 .btn-scramble이다.
+// 낱말 조각을 부모별로 묶어서 돌려준다. 화면마다 클래스가 다르다 -
+// 암기(영작 연습)/스펠은 .scramble-item, 리콜(듣고 배열)은 .btn-scramble,
+// 테스트는 클래스가 난독화돼 있어(c2NyYW1ibGUxNzg4MDU5MzMz = base64로
+// scramble1788059333, 세션마다 바뀜) data-idx 속성으로 잡는다.
 // 이 사이트는 지난/다음 카드가 DOM에 그대로 남는 일이 잦아서(단어 모드에서
 // 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
 // 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
@@ -1043,7 +1071,8 @@ _SCRAMBLE_JS = r"""
 // 조각도 DOM에는 있으므로 전부 돌려주되, 보이는지(vis) / 누를 수 있는지(clk)
 // / 화면 위치(top)를 같이 넘긴다. 이미 문장에 놓인 낱말도 같은 클래스라서
 // 아래 조각 묶음과 구분해야 하는데, 이 셋으로 파이썬 쪽에서 걸러낸다.
-var nodes = document.querySelectorAll('.scramble-item, .btn-scramble');
+var nodes = document.querySelectorAll(
+    '.scramble-item, .btn-scramble, a[data-idx]');
 var parents = [];
 var groups = [];
 for (var i = 0; i < nodes.length; i++) {
@@ -1056,6 +1085,7 @@ for (var i = 0; i < nodes.length; i++) {
   }
   var r = el.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) vis = false;
+  var cs = getComputedStyle(el);
   var p = el.parentElement;
   var idx = parents.indexOf(p);
   if (idx === -1) {
@@ -1068,10 +1098,11 @@ for (var i = 0; i < nodes.length; i++) {
     text: (el.textContent || '').trim(),
     vis: vis,
     clk: el.classList.contains('clickable'),
-    // 이미 눌러서 문장에 들어간 조각은 자리만 빈 상자로 남고 class에
-    // 'clicked'가 붙는다(글자 색도 투명). 글자는 그대로라 안 걸러내면
-    // 남은 조각 수를 잘못 세게 된다.
-    used: el.classList.contains('clicked'),
+    // 이미 눌러서 문장에 들어간 조각은 자리만 빈 상자로 남는다. 글자는
+    // 그대로라 안 걸러내면 남은 조각 수를 잘못 세게 된다. class에
+    // 'clicked'가 붙고 글자 색이 투명해지는데, 테스트 화면은 클래스가
+    // 난독화돼 있어 색까지 같이 본다.
+    used: el.classList.contains('clicked') || /,\s*0\s*\)$/.test(cs.color),
     top: r.top
   });
 }
@@ -1497,7 +1528,7 @@ def sentence_scramble_worker():
             ),
         )
         time.sleep(0.2)
-        press_space(driver)
+        press_submit(driver)
         time.sleep(0.45)
       else:
         time.sleep(0.5)
@@ -1564,6 +1595,13 @@ def on_kind_change():
   btn_spell_start.config(
       text='스펠 자동 풀이 시작',
       command=run_sentence_scramble if is_sentence else run_spelling_selenium,
+  )
+
+  # 문장 테스트도 어순배열이다. 제출만 스페이스가 아니라 ENTER.
+  frame_test.config(text=' 테스트 (어순배열) ' if is_sentence else ' 테스트 ')
+  btn_test_start.config(
+      text='테스트 자동 풀이 시작',
+      command=run_sentence_scramble if is_sentence else run_test_selenium,
   )
 
 
