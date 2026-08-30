@@ -447,17 +447,20 @@ _WRITE_PRACTICE_LABELS = ['영작 연습하기']
 _CLASS_TEST_URL_HINT = '/classtest/'
 
 
+def on_class_test(driver):
+  """문장 테스트(어순배열) 화면인지 주소로 판별한다."""
+  try:
+    return _CLASS_TEST_URL_HINT in (driver.current_url or '').lower()
+  except Exception:
+    return False
+
+
 def press_submit(driver):
   """배열을 마친 뒤 제출한다.
 
   암기/리콜/스펠은 스페이스로 넘어가지만, 테스트(어순배열)는 [제출] 버튼에
   ENTER가 붙어 있다. 주소로 구분한다."""
-  try:
-    is_test = _CLASS_TEST_URL_HINT in (driver.current_url or '').lower()
-  except Exception:
-    is_test = False
-
-  if not is_test:
+  if not on_class_test(driver):
     return press_space(driver)
 
   try:
@@ -1271,14 +1274,33 @@ _PLACED_TEXT_JS = r"""
 // 화면에 보이는 요소들의 글자를 모아 돌려준다. 문장 줄에 이미 채워진
 // 앞부분(리콜은 앞 낱말 몇 개를 미리 놓아준다)을 알아내기 위한 것이다.
 // 너무 긴 글자는 문단이나 페이지 전체이므로 제외한다.
+var CHIP = '.scramble-item, .btn-scramble, a[data-idx]';
+
+function isUsedChip(c) {
+  if (c.classList.contains('clicked')) return true;
+  try {
+    return /,\s*0\s*\)$/.test(getComputedStyle(c).color);
+  } catch (e) {
+    return false;
+  }
+}
+
 var out = [];
 var nodes = document.querySelectorAll('div, span, p, td, li, h1, h2, h3, label');
 for (var i = 0; i < nodes.length && out.length < 300; i++) {
   var el = nodes[i];
   // 조각 자체는 세면 안 된다. 조각 'I' 하나가 문장 첫 낱말과 같아서
-  // '앞 1낱말이 이미 놓였다'고 잘못 읽는 일이 있었다. 조각을 담고 있는
-  // 바깥 상자는 글자가 뒤섞인 순서라 앞부분과 안 맞으므로 그냥 둔다.
-  if (el.closest && el.closest('.scramble-item, .btn-scramble')) continue;
+  // '앞 1낱말이 이미 놓였다'고 잘못 읽는 일이 있었다.
+  if (el.closest && el.closest(CHIP)) continue;
+  // 아직 안 누른 조각을 품고 있는 상자도 마찬가지다. 조각 하나를 감싼
+  // 바깥 상자의 글자가 그 조각과 같아서 똑같이 속았다. 이미 놓인 낱말만
+  // 담고 있는 상자(문장 줄)는 그대로 센다.
+  var inner = el.querySelectorAll(CHIP);
+  var hasUnused = false;
+  for (var j = 0; j < inner.length; j++) {
+    if (!isUsedChip(inner[j])) { hasUnused = true; break; }
+  }
+  if (hasUnused) continue;
   var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
   if (!t || t.length > 300) continue;
   if (typeof el.checkVisibility === 'function') {
@@ -1371,6 +1393,9 @@ def click_scramble_in_order(driver, tokens):
   done_count = 0
   used = []
   retries = {}
+  # 테스트 화면 조각(<a data-idx>)은 자바스크립트로 만든 마우스 이벤트에
+  # 반응하지 않는다. 거기서는 처음부터 셀레니움 클릭을 쓴다.
+  native_click = on_class_test(driver)
 
   for step in range(len(tokens) * 3 + 6):
     if not is_running:
@@ -1424,8 +1449,9 @@ def click_scramble_in_order(driver, tokens):
       time.sleep(0.05)
       continue
 
-    # 한 번 실패한 낱말은 셀레니움 클릭(진짜 마우스 동작)으로 바꿔 본다.
-    if not click_chip(driver, target, native_first=retries.get(tok, 0) > 0):
+    # 한 번 실패한 낱말은 반대 방식으로 바꿔 본다.
+    flip = retries.get(tok, 0) > 0
+    if not click_chip(driver, target, native_first=native_click != flip):
       continue
 
     used.append(target)
