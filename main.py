@@ -1068,6 +1068,10 @@ for (var i = 0; i < nodes.length; i++) {
     text: (el.textContent || '').trim(),
     vis: vis,
     clk: el.classList.contains('clickable'),
+    // 이미 눌러서 문장에 들어간 조각은 자리만 빈 상자로 남고 class에
+    // 'clicked'가 붙는다(글자 색도 투명). 글자는 그대로라 안 걸러내면
+    // 남은 조각 수를 잘못 세게 된다.
+    used: el.classList.contains('clicked'),
     top: r.top
   });
 }
@@ -1079,9 +1083,8 @@ def read_scramble_groups(driver):
   """지금 화면에 떠 있는 카드의 낱말 조각을 [[(요소, 글자), ...], ...] 로.
 
   잘려서 안 보이는 조각도 포함한다 - 남은 낱말이 몇 개인지 정확히 알아야
-  지금 눌러야 할 자리를 계산할 수 있다. 다만 조각이 하나도 안 보이는
-  묶음은 지난 카드로 보고 버린다(이 사이트는 지난 카드가 DOM에 그대로
-  남는다)."""
+  지금 눌러야 할 자리를 계산할 수 있다. 다만 이미 누른 조각(class에
+  'clicked')과, 조각이 하나도 안 보이는 묶음(지난 카드)은 버린다."""
   try:
     raw = driver.execute_script(_SCRAMBLE_JS) or []
   except Exception:
@@ -1091,7 +1094,11 @@ def read_scramble_groups(driver):
   for group in raw:
     if not any(d.get('vis') for d in group):
       continue
-    items = [(d['el'], d['text']) for d in group if d.get('text')]
+    items = [
+        (d['el'], d['text'])
+        for d in group
+        if d.get('text') and not d.get('used')
+    ]
     if not items:
       continue
     tops = [d.get('top') or 0 for d in group]
