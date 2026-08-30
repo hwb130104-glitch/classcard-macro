@@ -1343,22 +1343,46 @@ def click_scramble_in_order(driver, tokens):
       time.sleep(0.05)
       continue
 
+    # 좌표로 누르는 셀레니움 클릭 대신 요소를 직접 누른다. 조각을 하나
+    # 누를 때마다 트레이가 다시 그려지면서 남은 조각들이 자리를 옮기는데,
+    # 좌표로 누르면 그 사이 밀려온 다른 조각을 눌러 순서가 뒤엉킨다.
     try:
-      target.click()
+      driver.execute_script('arguments[0].click();', target)
     except StaleElementReferenceException:
       continue
     except Exception:
       try:
-        driver.execute_script('arguments[0].click();', target)
+        target.click()
       except Exception as e:
         print('조각 클릭 에러:', e)
         return False
 
     used.append(target)
     done_count += 1
-    if done_count >= needed:
-      return True
-    time.sleep(0.07)
+
+    # 방금 누른 조각이 트레이에서 빠질 때까지 기다린다. 안 빠졌으면 클릭이
+    # 먹지 않은 것이므로 used에서 도로 빼고 다시 시도한다.
+    landed = False
+    for _ in range(12):
+      time.sleep(0.03)
+      if done_count >= needed:
+        # 마지막 조각을 누르면 트레이가 비어서 위 방식으로 확인할 수 없다.
+        # 문장 줄이 끝까지 채워졌는지로 확인한다.
+        if read_placed_count(driver, tokens, len(tokens)) >= len(tokens):
+          return True
+        continue
+
+      group = _pick_group_for(read_scramble_groups(driver), tokens)
+      if not any(el == target for el, _ in group):
+        landed = True
+        break
+
+    if not landed:
+      print(f"[DEBUG] '{tok}' 클릭이 안 먹은 듯해서 다시 시도")
+      used.pop()
+      done_count -= 1
+
+    time.sleep(0.04)
 
   print('[DEBUG] 조각을 다 못 눌러서 중단')
   return False
