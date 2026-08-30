@@ -438,6 +438,9 @@ return null;
 """
 
 _SECTION_DONE_LABELS = ['다음 구간으로 이동', '다음 구간 이동', '계속하기']
+# 테스트에서 덜 배열한 채 제출하면 '아직 배열하지 않은 단어가 있습니다'
+# 확인창이 뜬다. 떠 있으면 아무것도 못 누르므로 [취소]로 닫는다.
+_CANCEL_LABELS = ['취소']
 # 세트를 다 끝내면 "100% Clear!!" 화면에 [200% 도전]이 뜬다. 퍼센트는
 # 계속 올라가므로 숫자를 고정하지 않고 패턴으로 잡는다.
 _SECTION_DONE_PATTERNS = [r'^\d+% ?도전$']
@@ -1131,7 +1134,7 @@ if (typeof el.click === 'function') {
 """
 
 
-def click_chip(driver, el, native_first=False):
+def click_chip(driver, el, native_first=False, debug=False):
   """조각 하나를 누른다.
 
   기본은 자바스크립트로 요소에 직접 이벤트를 보낸다 - 셀레니움 클릭은
@@ -1140,15 +1143,19 @@ def click_chip(driver, el, native_first=False):
   바꿔서 시도한다."""
   order = (True, False) if native_first else (False, True)
   for native in order:
+    name = '셀레니움' if native else 'JS'
     try:
       if native:
         el.click()
       else:
         driver.execute_script(_CLICK_CHIP_JS, el)
+      if debug:
+        print(f'[DEBUG] {name} 클릭 보냄')
       return True
     except StaleElementReferenceException:
       return False
-    except Exception:
+    except Exception as e:
+      print(f'[DEBUG] {name} 클릭 실패: {str(e).splitlines()[0][:120]}')
       continue
   return False
 
@@ -1453,7 +1460,9 @@ def click_scramble_in_order(driver, tokens):
 
     # 한 번 실패한 낱말은 반대 방식으로 바꿔 본다.
     flip = retries.get(tok, 0) > 0
-    if not click_chip(driver, target, native_first=native_click != flip):
+    if not click_chip(
+        driver, target, native_first=native_click != flip, debug=flip
+    ):
       continue
 
     used.append(target)
@@ -1520,6 +1529,12 @@ def sentence_scramble_worker():
     open_logged = False
 
     while is_running:
+      # 덜 배열한 채 제출하면 확인창이 뜨고, 그게 떠 있는 동안은 조각을
+      # 눌러도 아무 반응이 없다. 보이면 [취소]로 닫고 다시 시작한다.
+      if click_button_by_text(driver, _CANCEL_LABELS, wait_after=0.4):
+        solved_key = None
+        continue
+
       groups = read_scramble_groups(driver)
       matched = match_scramble_sentence(groups)
 
