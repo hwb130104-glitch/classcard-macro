@@ -1199,6 +1199,10 @@ var out = [];
 var nodes = document.querySelectorAll('div, span, p, td, li, h1, h2, h3, label');
 for (var i = 0; i < nodes.length && out.length < 300; i++) {
   var el = nodes[i];
+  // 조각 자체는 세면 안 된다. 조각 'I' 하나가 문장 첫 낱말과 같아서
+  // '앞 1낱말이 이미 놓였다'고 잘못 읽는 일이 있었다. 조각을 담고 있는
+  // 바깥 상자는 글자가 뒤섞인 순서라 앞부분과 안 맞으므로 그냥 둔다.
+  if (el.closest && el.closest('.scramble-item, .btn-scramble')) continue;
   var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
   if (!t || t.length > 300) continue;
   if (typeof el.checkVisibility === 'function') {
@@ -1290,6 +1294,7 @@ def click_scramble_in_order(driver, tokens):
   needed = 0
   done_count = 0
   used = []
+  retries = {}
 
   for step in range(len(tokens) * 3 + 6):
     if not is_running:
@@ -1378,6 +1383,10 @@ def click_scramble_in_order(driver, tokens):
         break
 
     if not landed:
+      retries[tok] = retries.get(tok, 0) + 1
+      if retries[tok] > 3:
+        print(f"[DEBUG] '{tok}'을 계속 못 눌러서 이번 문장 포기")
+        return False
       print(f"[DEBUG] '{tok}' 클릭이 안 먹은 듯해서 다시 시도")
       used.pop()
       done_count -= 1
