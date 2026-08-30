@@ -1065,8 +1065,10 @@ def test_worker():
 _SCRAMBLE_JS = r"""
 // 낱말 조각을 부모별로 묶어서 돌려준다. 화면마다 클래스가 다르다 -
 // 암기(영작 연습)/스펠은 .scramble-item, 리콜(듣고 배열)은 .btn-scramble,
-// 테스트는 클래스가 난독화돼 있어(c2NyYW1ibGUxNzg4MDU5MzMz = base64로
-// scramble1788059333, 세션마다 바뀜) data-idx 속성으로 잡는다.
+// 테스트는 클래스가 난독화돼 있다(c2NyYW1ibGUxNzg4MDU5MzMz = base64로
+// scramble1788059333, 세션마다 바뀜). data-idx로 잡았더니 페이지의 강의
+// 목록 링크까지 걸려서 엉뚱한 묶음을 보고 있었다. base64는 3글자씩 끊어
+// 인코딩하므로 앞의 'scramb'에 해당하는 c2NyYW1i는 항상 같다.
 // 이 사이트는 지난/다음 카드가 DOM에 그대로 남는 일이 잦아서(단어 모드에서
 // 크게 데였다) 전체를 한 줄로 읽으면 다른 카드 조각이 섞인다. 부모가 다르면
 // 다른 카드이므로 묶어두면 현재 카드만 골라낼 수 있다.
@@ -1075,7 +1077,7 @@ _SCRAMBLE_JS = r"""
 // / 화면 위치(top)를 같이 넘긴다. 이미 문장에 놓인 낱말도 같은 클래스라서
 // 아래 조각 묶음과 구분해야 하는데, 이 셋으로 파이썬 쪽에서 걸러낸다.
 var nodes = document.querySelectorAll(
-    '.scramble-item, .btn-scramble, a[data-idx]');
+    '.scramble-item, .btn-scramble, [class*="c2NyYW1i"]');
 var parents = [];
 var groups = [];
 for (var i = 0; i < nodes.length; i++) {
@@ -1274,7 +1276,7 @@ _PLACED_TEXT_JS = r"""
 // 화면에 보이는 요소들의 글자를 모아 돌려준다. 문장 줄에 이미 채워진
 // 앞부분(리콜은 앞 낱말 몇 개를 미리 놓아준다)을 알아내기 위한 것이다.
 // 너무 긴 글자는 문단이나 페이지 전체이므로 제외한다.
-var CHIP = '.scramble-item, .btn-scramble, a[data-idx]';
+var CHIP = '.scramble-item, .btn-scramble, [class*="c2NyYW1i"]';
 
 function isUsedChip(c) {
   if (c.classList.contains('clicked')) return true;
@@ -1465,7 +1467,9 @@ def click_scramble_in_order(driver, tokens):
     for _ in range(12):
       time.sleep(0.03)
       group = _pick_group_for(read_scramble_groups(driver), tokens)
-      if not any(el == target for el, _ in group):
+      # 묶음을 아예 못 찾은 상태를 '빠졌다'로 보면 안 된다. 엉뚱한 요소를
+      # 조각으로 잡던 시절, 이것 때문에 안 눌린 것을 눌린 걸로 착각했다.
+      if group and not any(el == target for el, _ in group):
         landed = True
         break
       if read_placed_count(driver, tokens, len(tokens)) >= idx + 1:
