@@ -1191,46 +1191,110 @@ def _pick_group_for(groups, tokens):
   return []
 
 
-def _next_token_index(tokens, chips):
+_PLACED_TEXT_JS = r"""
+// 화면에 보이는 요소들의 글자를 모아 돌려준다. 문장 줄에 이미 채워진
+// 앞부분(리콜은 앞 낱말 몇 개를 미리 놓아준다)을 알아내기 위한 것이다.
+// 너무 긴 글자는 문단이나 페이지 전체이므로 제외한다.
+var out = [];
+var nodes = document.querySelectorAll('div, span, p, td, li, h1, h2, h3, label');
+for (var i = 0; i < nodes.length && out.length < 300; i++) {
+  var el = nodes[i];
+  var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 300) continue;
+  if (typeof el.checkVisibility === 'function') {
+    try {
+      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
+        continue;
+      }
+    } catch (e) {}
+  }
+  var r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) continue;
+  out.push(t);
+}
+return out;
+"""
+
+
+def read_placed_count(driver, tokens, limit):
+  """문장 줄에 이미 채워진 낱말이 몇 개인지 화면 글자로 알아낸다.
+
+  조각 트레이는 문장 순서대로 일정 개수씩 밀려 나오는 창이라, 같은 낱말이
+  반복되는 문장에서는 조각만으로 창의 시작 위치를 정할 수 없다('I ... I ...'
+  는 0번째부터 봐도, 1번째부터 봐도 구성이 같다). 화면에 이미 놓인 앞부분을
+  읽으면 그 자리가 확정된다.
+
+  limit(= 전체 낱말 수 - 남은 조각 수)보다 큰 건 무시한다. 오답 뒤에 뜨는
+  '정답' 줄처럼 문장 전체가 적힌 글자에 속지 않기 위해서다."""
+  if limit <= 0:
+    return 0
+
+  try:
+    texts = driver.execute_script(_PLACED_TEXT_JS) or []
+  except Exception:
+    return 0
+
+  best = 0
+  for text in texts:
+    words = [w for w in (_norm_token(x) for x in _norm_quotes(text).split()) if w]
+    n = len(words)
+    if n <= best or n > limit:
+      continue
+    if words == tokens[:n]:
+      best = n
+  return best
+
+
+def _next_token_index(tokens, chips, placed=None):
   """남은 조각들로 미루어, 지금 눌러야 할 낱말이 문장의 몇 번째인지.
 
-  조각은 '아직 안 놓인 낱말'만 남아 있고, 놓인 낱말은 항상 문장 앞부분이다.
-  그래서 tokens의 뒤쪽 일부가 조각을 전부 포함하는 가장 늦은 지점을 찾으면
-  그게 다음에 눌러야 할 자리다. 예: 13낱말 문장에서 조각이
-  [the, fresh, air, there]면 9번째부터 남은 것이므로 tokens[9]를 누른다.
+  조각 트레이는 문장 순서대로 일정 개수씩 밀려 나오는 '창'이다. 긴 문장은
+  앞에서부터 7개만 DOM에 있고(F12로 확인), 하나 누를 때마다 뒤가 채워진다.
+  그래서 조각 구성은 언제나 tokens의 연속된 한 구간과 정확히 일치한다.
+  그 구간이 시작되는 자리가 곧 지금 눌러야 할 자리다.
 
-  조각을 다 읽었다면 남은 낱말과 개수가 정확히 맞고, 그 지점이 답이다.
-  개수가 안 맞으면(조각 일부가 아직 DOM에 없는 경우) 어디부터인지 확신할 수
-  없다. 예전엔 '조각을 전부 포함하는 가장 늦은 지점'으로 때웠는데, 같은
-  낱말이 두 번 나오는 문장에서 엉뚱한 자리를 골라 틀린 답을 제출했다.
-  확신이 없으면 None을 돌려주고 건드리지 않는다."""
-  k0 = len(tokens) - len(chips)
-  if k0 >= 0 and sorted(tokens[k0:]) == sorted(chips):
-    return k0
+  같은 낱말이 반복되는 문장이면 맞는 구간이 여럿일 수 있다. 그때는 화면에
+  이미 놓인 앞부분 낱말 수(placed)와 맞는 것을 고르고, 그래도 못 정하면
+  앞쪽을 쓴다."""
+  n = len(chips)
+  if n == 0 or n > len(tokens):
+    return None
+
+  wanted = sorted(chips)
+  found = [
+      k for k in range(len(tokens) - n + 1)
+      if sorted(tokens[k:k + n]) == wanted
+  ]
+  if not found:
+    return None
+  if len(found) == 1 or placed is None:
+    return found[0]
+  if placed in found:
+    return placed
+  # 어디서부터인지 확신할 수 없으면 건드리지 않는다. 찍어서 누르면 틀린
+  # 답이 그대로 제출된다.
   return None
 
 
 def click_scramble_in_order(driver, tokens):
   """정답 순서대로 조각을 클릭한다.
 
-  한 번 누를 때마다 화면을 다시 읽고 '다음에 누를 낱말'을 새로 계산한다.
-  처음엔 시작할 때 한 번만 훑어서 건너뛸 낱말을 정했는데, 조각이 남은
-  낱말만 조금씩 나타나는 화면(리콜)에서는 아직 안 나온 낱말까지 '이미
-  놓였다'고 잘못 판단해 문장을 중간까지만 배열했다.
+  시작 자리는 처음 읽은 조각으로 한 번만 정하고, 그 뒤로는 우리가 누른
+  횟수로 진행 상황을 안다. 조각이 다 나와 있지 않아서(창 방식) 매번 다시
+  계산하면 자리를 잘못 잡는다.
 
-  긴 문장은 조각이 '...'로 잘려 보이는데, 잘린 것도 셈에는 넣고 클릭은
-  자바스크립트로 한다(잘린 요소는 일반 클릭이 막힌다). 이미 누른 조각은
-  따로 기억해 다시 누르지 않는다."""
-  used = []
-  needed = None  # 이번 문장에서 눌러야 할 조각 수 (처음 읽을 때 정해진다)
+  누른 조각은 문장 줄로 옮겨가면서 같은 클래스를 그대로 달고 있으므로,
+  이미 누른 것은 따로 기억해 다시 누르지 않는다. 처음 정한 자리부터 문장
+  끝까지 다 누르면 끝낸다."""
+  start = None
+  needed = 0
   done_count = 0
+  used = []
 
-  for step in range(len(tokens) * 2 + 4):
+  for step in range(len(tokens) * 3 + 6):
     if not is_running:
       return False
 
-    # 잘려서 안 보이는 조각까지 포함해 읽는다. 남은 낱말이 몇 개인지
-    # 정확히 알아야 지금 눌러야 할 자리를 계산할 수 있다.
     items = []
     for attempt in range(30):  # 다음 조각이 나타날 때까지 최대 1.5초
       if not is_running:
@@ -1244,28 +1308,30 @@ def click_scramble_in_order(driver, tokens):
       if items:
         break
       # 조각을 누르면 트레이가 다시 그려지느라 잠깐 비는 순간이 있다.
-      # 촘촘히 확인해서 그 틈을 오래 기다리지 않는다.
       time.sleep(0.05)
 
     if not items:
-      return True  # 더 놓을 조각이 없으면 문장을 다 배열한 것
+      return start is not None and done_count >= needed
 
-    chips = [_norm_token(txt) for _, txt in items]
-    if needed is None:
-      # 처음 본 조각 수가 곧 눌러야 할 횟수다. 다 누르고 나면 문장 줄에
-      # 놓인 낱말들만 남는데(그것도 같은 클래스라 다시 잡힌다) 거기서
-      # 멈추지 않으면 이미 놓은 낱말을 또 눌러 답을 망가뜨린다.
-      needed = len(chips)
+    if start is None:
+      chips = [_norm_token(txt) for _, txt in items]
+      placed = read_placed_count(driver, tokens, len(tokens) - len(chips))
+      start = _next_token_index(tokens, chips, placed)
+      if start is None:
+        print(
+            f'[DEBUG] 조각 {len(chips)}개가 문장의 어느 구간과도 안 맞아 중단'
+            f' (조각={chips})'
+        )
+        return False
+      needed = len(tokens) - start
+      if start:
+        print(f'[DEBUG] 앞 {start}낱말은 이미 놓여 있어 그다음부터 누른다')
 
-    k = _next_token_index(tokens, chips)
-    if k is None or k >= len(tokens):
-      print(
-          f'[DEBUG] 조각 {len(chips)}개가 남은 낱말과 안 맞아 중단'
-          f' (조각={chips})'
-      )
-      return False
+    idx = start + done_count
+    if idx >= len(tokens):
+      return True
 
-    tok = tokens[k]
+    tok = tokens[idx]
     target = None
     for el, txt in items:
       if _norm_token(txt) == tok:
@@ -1273,7 +1339,7 @@ def click_scramble_in_order(driver, tokens):
         break
 
     if target is None:
-      # 눌러야 할 낱말이 아직 화면에 안 들어왔다. 잠깐 뒤에 다시 본다.
+      # 눌러야 할 낱말이 아직 트레이에 안 들어왔다. 잠깐 뒤에 다시 본다.
       time.sleep(0.05)
       continue
 
