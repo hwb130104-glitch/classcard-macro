@@ -304,28 +304,47 @@ def _sentence_tokens(sentence):
   return [t for t in (_norm_token(w) for w in _norm_quotes(sentence).split()) if t]
 
 
+def _norm_meaning(text):
+  """뜻 비교용 정규화.
+
+  같은 뜻인데 구분 기호만 다른 경우가 있다 - 단어장에는
+  '낭비하다; 쓰레기, 낭비'로 들어 있는데 화면 보기는
+  '낭비하다, 쓰레기, 낭비'로 나온다. 세미콜론을 쉼표로 맞추고, 기호 둘레의
+  공백과 끝에 붙은 마침표/기호를 정리한다."""
+  t = _norm_quotes(text).replace(';', ',').replace('·', ',')
+  t = re.sub(r'\s*,\s*', ',', t)
+  return t.strip().strip(',.')
+
+
 def _pick_choice(choices, target):
   """보기 목록에서 정답 보기를 골라 (인덱스, 요소, 텍스트)를 돌려준다.
 
   단순 포함(in) 비교만 하면 '[형] 신'을 찾을 때 위에 있는 '[형] 신축성
   있는'이 먼저 걸려서 오답을 골랐다(리콜/테스트 양쪽에서 실제로 발생).
-  완전히 같은 것 -> 품사 태그만 뗀 것이 같은 것 -> 마지막 수단으로 포함
-  관계 순으로 단계를 나눠서, 정확한 보기가 있으면 항상 그쪽을 고른다."""
+  완전히 같은 것 -> 품사 태그만 뗀 것 -> 구분 기호까지 맞춘 것 -> 마지막
+  수단으로 포함 관계 순으로 단계를 나눠서, 정확한 보기가 있으면 항상
+  그쪽을 고른다."""
   target_norm = _norm_space(target)
   target_stripped = _strip_pos_tag(target_norm)
+  target_meaning = _norm_meaning(target_stripped)
+
   items = []
   for idx, (el, raw) in enumerate(choices):
     txt = _norm_space(raw)
     if txt:
-      items.append((idx, el, txt, _strip_pos_tag(txt)))
+      stripped = _strip_pos_tag(txt)
+      items.append((idx, el, txt, stripped, _norm_meaning(stripped)))
 
-  for idx, el, txt, txt_stripped in items:
+  for idx, el, txt, _, _m in items:
     if txt == target_norm:
       return idx, el, txt
-  for idx, el, txt, txt_stripped in items:
-    if target_stripped and txt_stripped == target_stripped:
+  for idx, el, txt, stripped, _m in items:
+    if target_stripped and stripped == target_stripped:
       return idx, el, txt
-  for idx, el, txt, txt_stripped in items:
+  for idx, el, txt, _s, meaning in items:
+    if target_meaning and meaning == target_meaning:
+      return idx, el, txt
+  for idx, el, txt, _s, _m in items:
     if target_norm in txt or txt in target_norm:
       return idx, el, txt
   return None
