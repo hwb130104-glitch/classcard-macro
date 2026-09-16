@@ -499,14 +499,26 @@ def find_button_by_text(driver, labels, patterns=None):
     return None
 
 
-def click_button_by_text(driver, labels, patterns=None, wait_after=1.2):
+def click_button_by_text(
+    driver, labels, patterns=None, wait_after=1.2, wait_before=0.0
+):
   """해당 버튼이 보이면 눌러서 True를 돌려준다. 클릭이 막히면 스페이스로
-  대체한다(이런 화면에는 항상 SPACE 안내가 같이 붙어 있다)."""
+  대체한다(이런 화면에는 항상 SPACE 안내가 같이 붙어 있다).
+
+  wait_before를 주면 그만큼 기다렸다 누른다. 구간 완료 화면이 뜨자마자
+  넘겨버리면 눈으로 확인할 새가 없어서 잠시 두기 위한 것이다."""
   btn = find_button_by_text(driver, labels, patterns)
   if not btn:
     return False
 
   print(f'[DEBUG] 버튼 감지 - 클릭: {labels}')
+
+  if wait_before:
+    for _ in range(int(wait_before / 0.1)):
+      if not is_running:
+        return False
+      time.sleep(0.1)
+
   moved = False
   try:
     btn.click()
@@ -520,9 +532,11 @@ def click_button_by_text(driver, labels, patterns=None, wait_after=1.2):
 
 
 def handle_section_done(driver):
-  """구간/세트 완료 화면이면 다음으로 넘기고 True를 돌려준다."""
+  """구간/세트 완료 화면이면 다음으로 넘기고 True를 돌려준다.
+
+  화면이 뜨자마자 넘기면 너무 빨라서, 1.5초 두고 누른다."""
   return click_button_by_text(
-      driver, _SECTION_DONE_LABELS, _SECTION_DONE_PATTERNS
+      driver, _SECTION_DONE_LABELS, _SECTION_DONE_PATTERNS, wait_before=1.5
   )
 
 
