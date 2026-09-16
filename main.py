@@ -125,6 +125,9 @@ def memo_worker():
     ready = False
 
     while is_running:
+      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
+      focus_study_tab(driver)
+
       # 구간이 끝나 완료 화면이 떠 있으면 먼저 다음 구간으로 넘긴다.
       if handle_section_done(driver):
         continue
@@ -450,6 +453,40 @@ _WRITE_PRACTICE_LABELS = ['영작 연습하기']
 _CLASS_TEST_URL_HINT = '/classtest/'
 
 
+_STUDY_URL_HINTS = ('/memorize/', '/recall/', '/spell/', '/classtest/')
+
+
+def focus_study_tab(driver):
+  """학습 화면이 열려 있는 탭으로 옮긴다.
+
+  셀레니움은 처음 잡은 탭만 들여다본다. 사용자가 새 탭에서 학습 화면을 열면
+  매크로는 엉뚱한 탭을 보며 '화면을 기다리는 중'만 반복한다(화면에는 문제가
+  멀쩡히 떠 있는데 아무것도 못 읽는 증상). 지금 탭이 학습 화면이 아니면
+  열려 있는 탭들을 훑어서 학습 화면인 탭으로 옮긴다."""
+  try:
+    if any(h in (driver.current_url or '').lower() for h in _STUDY_URL_HINTS):
+      return True
+  except Exception:
+    return False
+
+  try:
+    current = driver.current_window_handle
+  except Exception:
+    current = None
+
+  try:
+    for handle in driver.window_handles:
+      driver.switch_to.window(handle)
+      if any(h in (driver.current_url or '').lower() for h in _STUDY_URL_HINTS):
+        print('[DEBUG] 학습 화면이 열린 탭으로 이동')
+        return True
+    if current:
+      driver.switch_to.window(current)
+  except Exception:
+    pass
+  return False
+
+
 def on_class_test(driver):
   """문장 테스트(어순배열) 화면인지 주소로 판별한다."""
   try:
@@ -621,6 +658,9 @@ def selenium_worker():
     last_logged_qtext = None
 
     while is_running:
+      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
+      focus_study_tab(driver)
+
       current_word = None
 
       # 1) 화면에 실제로 렌더링된 문제 요소만 읽는다(checkVisibility 기반).
@@ -756,6 +796,9 @@ def spelling_worker():
     last_logged_qtext = None
 
     while is_running:
+      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
+      focus_study_tab(driver)
+
       current_word = None
       current_word_el = None
 
@@ -909,6 +952,9 @@ def test_worker():
     empty_streak = 0
 
     while is_running:
+      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
+      focus_study_tab(driver)
+
       current_word = None
       current_cand_norm = None
       direction = None  # 'eng_to_kor' 또는 'kor_to_eng'
@@ -1538,6 +1584,9 @@ def sentence_scramble_worker():
     open_logged = False
 
     while is_running:
+      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
+      focus_study_tab(driver)
+
       # 덜 배열한 채 제출하면 확인창이 뜨고, 그게 떠 있는 동안은 조각을
       # 눌러도 아무 반응이 없다. 보이면 [취소]로 닫고 다시 시작한다.
       # 이 확인창은 테스트 화면에만 있다 - 다른 화면에서까지 '취소'를
