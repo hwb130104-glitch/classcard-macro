@@ -1540,7 +1540,11 @@ def sentence_scramble_worker():
     while is_running:
       # 덜 배열한 채 제출하면 확인창이 뜨고, 그게 떠 있는 동안은 조각을
       # 눌러도 아무 반응이 없다. 보이면 [취소]로 닫고 다시 시작한다.
-      if click_button_by_text(driver, _CANCEL_LABELS, wait_after=0.4):
+      # 이 확인창은 테스트 화면에만 있다 - 다른 화면에서까지 '취소'를
+      # 찾으면 엉뚱한 버튼을 누를 수 있으므로 주소로 제한한다.
+      if on_class_test(driver) and click_button_by_text(
+          driver, _CANCEL_LABELS, wait_after=0.4
+      ):
         solved_key = None
         continue
 
