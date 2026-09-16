@@ -444,6 +444,9 @@ _SECTION_DONE_LABELS = ['다음 구간으로 이동', '다음 구간 이동', '�
 # 테스트에서 덜 배열한 채 제출하면 '아직 배열하지 않은 단어가 있습니다'
 # 확인창이 뜬다. 떠 있으면 아무것도 못 누르므로 [취소]로 닫는다.
 _CANCEL_LABELS = ['취소']
+# 단어장에 따라 답을 고른 뒤 자동으로 안 넘어가고 [다음 카드](SPACE)를
+# 기다리는 화면이 있다.
+_NEXT_CARD_LABELS = ['다음 카드', '다음카드', '다음 문제']
 # 세트를 다 끝내면 "100% Clear!!" 화면에 [200% 도전]이 뜬다. 퍼센트는
 # 계속 올라가므로 숫자를 고정하지 않고 패턴으로 잡는다.
 _SECTION_DONE_PATTERNS = [r'^\d+% ?도전$']
@@ -736,6 +739,11 @@ def selenium_worker():
         # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
         if handle_section_done(driver):
           continue
+        # 답을 고른 뒤 [다음 카드]를 기다리는 화면이면 눌러서 넘어간다.
+        if click_button_by_text(
+            driver, _NEXT_CARD_LABELS, wait_after=0.4
+        ):
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
@@ -879,6 +887,11 @@ def spelling_worker():
       else:
         # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
         if handle_section_done(driver):
+          continue
+        # 답을 고른 뒤 [다음 카드]를 기다리는 화면이면 눌러서 넘어간다.
+        if click_button_by_text(
+            driver, _NEXT_CARD_LABELS, wait_after=0.4
+        ):
           continue
         root.after(
             0,
@@ -1097,6 +1110,11 @@ def test_worker():
       else:
         # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
         if handle_section_done(driver):
+          continue
+        # 답을 고른 뒤 [다음 카드]를 기다리는 화면이면 눌러서 넘어간다.
+        if click_button_by_text(
+            driver, _NEXT_CARD_LABELS, wait_after=0.4
+        ):
           continue
         root.after(
             0,
