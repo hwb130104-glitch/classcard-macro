@@ -81,6 +81,7 @@ def load_from_clipboard():
       btn_recall_start.config(state=tk.NORMAL)
       btn_spell_start.config(state=tk.NORMAL)
       btn_test_start.config(state=tk.NORMAL)
+      on_kind_change()  # 문장 모드에서 막아둔 버튼은 계속 막아둔다
     else:
       messagebox.showerror('에러', '올바른 클래스카드 데이터가 아닙니다.')
   except Exception:
@@ -1769,11 +1770,17 @@ def on_kind_change():
       command=run_sentence_scramble if is_sentence else run_spelling_selenium,
   )
 
-  # 문장 테스트도 어순배열이다. 제출만 스페이스가 아니라 ENTER.
-  frame_test.config(text=' 테스트 (어순배열) ' if is_sentence else ' 테스트 ')
+  # 문장 테스트도 어순배열이지만, 조각 클릭이 아직 안정적이지 않아 막아둔다.
+  # (문장 단어장을 받을 수 없어 확인을 못 한 상태)
+  frame_test.config(text=' 테스트 (준비 중) ' if is_sentence else ' 테스트 ')
+  if is_sentence:
+    test_state = tk.DISABLED
+  else:
+    test_state = tk.NORMAL if (word_list and not is_running) else tk.DISABLED
   btn_test_start.config(
-      text='테스트 자동 풀이 시작',
+      text='문장 테스트는 준비 중' if is_sentence else '테스트 자동 풀이 시작',
       command=run_sentence_scramble if is_sentence else run_test_selenium,
+      state=test_state,
   )
 
 
@@ -1787,6 +1794,7 @@ def stop_macro(event=None):
   btn_spell_start.config(state=tk.NORMAL)
   btn_test_start.config(state=tk.NORMAL)
   btn_stop.config(state=tk.DISABLED)
+  on_kind_change()  # 문장 모드에서 막아둔 버튼은 계속 막아둔다
 
 
 # --- UI 구성 ---
