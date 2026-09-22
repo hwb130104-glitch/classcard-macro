@@ -7,6 +7,12 @@ OutputDir=.
 OutputBaseFilename=Classcard_Setup
 Compression=lzma
 SolidCompression=yes
+; 설치/삭제 화면 문구를 전부 한국어로 (언어 선택 창은 안 띄움)
+ShowLanguageDialog=no
+UninstallDisplayName=클래스카드 매크로
+
+[Languages]
+Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Files]
 ; 매크로 메인 프로그램 (암기.exe)
