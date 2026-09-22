@@ -35,7 +35,7 @@ word_list = []
 shared_driver = None
 # 문장 단어장 모드(왼쪽 위 [단어]/[문장] 전환). 지금은 문장 단어장을 받을 수
 # 없어 확인이 안 되므로 숨겨둔다. 다시 쓸 때 True로 바꾸면 된다.
-SENTENCE_MODE_ENABLED = False
+SENTENCE_MODE_ENABLED = True
 # 암기: 사용자가 사이트에서 학습을 시작한 뒤 [시작] 버튼을 눌러야 키를 보낸다.
 memo_go = threading.Event()
 
@@ -308,12 +308,14 @@ def run_test_selenium():
 # 문장 단어장은 암기(영작 연습)도, 리콜(듣고 배열하기)도 낱말 조각을 순서대로
 # 누르는 방식이라 같은 워커를 쓴다. 리콜은 문제가 소리로만 나오지만, 조각
 # 구성만 보면 어떤 문장인지 알 수 있어서 들을 필요가 없다.
-def run_sentence_scramble():
+def run_sentence_scramble(mode_name='문장'):
+  """문장 모드 공통 실행. mode_name은 상태 표시에만 쓴다(예: '리콜')."""
   if not word_list:
     messagebox.showwarning('알림', '먼저 [불러오기]로 문장을 로드해주세요.')
     return
 
-  t = threading.Thread(target=sentence_scramble_worker, daemon=True)
+  t = threading.Thread(
+      target=sentence_scramble_worker, args=(mode_name,), daemon=True)
   t.start()
 
 
@@ -1796,19 +1798,22 @@ _CLICK_CHIP_JS = r"""
 // 조각을 누른다. el.click()만으로는 반응하지 않는 화면이 있어서(테스트
 // 화면의 조각은 <a data-idx="0">라 마우스 이벤트를 직접 받는다) 실제
 // 마우스 동작과 같은 순서로 이벤트를 보낸다.
+//
+// 클릭은 반드시 한 번만 보낸다. 예전엔 click 이벤트를 보낸 뒤 el.click()을
+// 또 불러서 조각마다 두 번 눌렸다. 사이트 코드(spell_sentence.js)를 풀어보니
+// 조각을 누르면 '지금 놓일 차례의 낱말인지'만 보고 아니면 즉시 오답(shake)
+// 처리한다 - 이미 누른 조각인지는 안 본다. 그래서 두 번째 클릭이 '다음
+// 낱말 자리에 앞 낱말을 누른 것'이 되어 문장 스펠이 전부 오답이 됐다.
 var el = arguments[0];
 var opts = {bubbles: true, cancelable: true, view: window, button: 0};
 el.dispatchEvent(new MouseEvent('mouseover', opts));
 el.dispatchEvent(new MouseEvent('mousedown', opts));
 el.dispatchEvent(new MouseEvent('mouseup', opts));
 el.dispatchEvent(new MouseEvent('click', opts));
-if (typeof el.click === 'function') {
-  try { el.click(); } catch (e) {}
-}
 """
 
 
-def click_chip(driver, el, native_first=False, debug=False):
+def click_chip(driver, el, native_first=False, debug=False, allow_js=True):
   """조각 하나를 누른다.
 
   기본은 자바스크립트로 요소에 직접 이벤트를 보낸다 - 셀레니움 클릭은
@@ -1816,6 +1821,8 @@ def click_chip(driver, el, native_first=False, debug=False):
   조각을 누르는 일이 있었다. 그래도 반응이 없으면 셀레니움 클릭으로
   바꿔서 시도한다."""
   order = (True, False) if native_first else (False, True)
+  if not allow_js:
+    order = (True,)
   for native in order:
     name = '셀레니움' if native else 'JS'
     try:
@@ -2061,6 +2068,24 @@ def _next_token_index(tokens, chips, placed=None):
   return None
 
 
+# 화면(주소)별로 실제로 먹힌 조각 클릭 방식. True=셀레니움, False=JS.
+# 문장 리콜은 JS 클릭이 안 먹고 셀레니움 클릭만 먹어서, 조각마다 JS로 한 번
+# 헛클릭 -> 확인 -> 셀레니움으로 다시 누르느라 느렸다(로그: 매 조각 '클릭이
+# 안 먹은 듯해서 다시 시도'). 한 번 먹힌 방식을 기억해 다음부터 바로 쓴다.
+_chip_click_native = {}
+
+
+def _study_page_kind(driver):
+  try:
+    url = (driver.current_url or '').lower()
+  except Exception:
+    return ''
+  for hint in ('/memorize/', '/recall/', '/spell/', '/classtest/'):
+    if hint in url:
+      return hint
+  return ''
+
+
 def click_scramble_in_order(driver, tokens):
   """정답 순서대로 조각을 클릭한다.
 
@@ -2076,9 +2101,26 @@ def click_scramble_in_order(driver, tokens):
   done_count = 0
   used = []
   retries = {}
-  # 테스트 화면 조각(<a data-idx>)은 자바스크립트로 만든 마우스 이벤트에
-  # 반응하지 않는다. 거기서는 처음부터 셀레니움 클릭을 쓴다.
-  native_click = on_class_test(driver)
+  # 테스트 화면 조각은 '진짜 클릭'만 받는다. 사이트 코드
+  # (class_test_sentence.js)를 풀어보니 클릭 이벤트의 isTrusted가 false면
+  # 그냥 무시한다 - 자바스크립트로 만든 클릭은 전부 헛클릭이다. 그래서
+  # 테스트에서는 셀레니움 클릭만 쓴다.
+  page = _study_page_kind(driver)
+  in_test = page == '/classtest/'
+  native_click = True if in_test else _chip_click_native.get(page, False)
+  # 조각 줄이 새로 그려질 수 있는 때(카드 시작, 줄을 다 누른 뒤, 클릭 실패
+  # 뒤)에만 '줄이 멈췄는지' 확인한다. 매번 하면 조각마다 느려진다.
+  need_stable = True
+  t_begin = time.time()
+  landed_waits = []
+
+  def report():
+    # 조각을 누르는 속도가 느리다고 해서, 어디서 시간이 드는지 로그로 본다.
+    if done_count:
+      took = time.time() - t_begin
+      avg_wait = sum(landed_waits) / len(landed_waits) if landed_waits else 0
+      print(f'[DEBUG] 조각 {done_count}개 {took:.2f}초 (조각당 {took / done_count:.2f}초,'
+            f' 눌린 것 확인 평균 {avg_wait:.2f}초)')
 
   for step in range(len(tokens) * 3 + 6):
     if not is_running:
@@ -2094,12 +2136,30 @@ def click_scramble_in_order(driver, tokens):
           for el, txt in _pick_group_for(groups, tokens)
           if not any(el == prev for prev in used)
       ]
+      if items and in_test and need_stable:
+        # 테스트는 카드가 넘어오는 순간 조각이 알파벳 순서로 잠깐 보였다가
+        # 섞인 순서로 새로 그려진다. 셀레니움 클릭은 좌표로 누르므로, 다시
+        # 그려지기 전 조각을 보고 누르면 그 자리에 새로 온 엉뚱한 조각이
+        # 눌렸다(영상: Traditional 대신 Korean). 잠깐 뒤 다시 읽어서 조각
+        # 줄이 그대로일 때만 누른다.
+        time.sleep(0.12)
+        again = [
+            (el, txt)
+            for el, txt in _pick_group_for(read_scramble_groups(driver), tokens)
+            if not any(el == prev for prev in used)
+        ]
+        if [e.id for e, _ in again] != [e.id for e, _ in items]:
+          items = []
+          continue
+        items = again
+        need_stable = False
       if items:
         break
       # 조각을 누르면 트레이가 다시 그려지느라 잠깐 비는 순간이 있다.
       time.sleep(0.05)
 
     if not items:
+      report()
       return start is not None and done_count >= needed
 
     if start is None:
@@ -2118,6 +2178,7 @@ def click_scramble_in_order(driver, tokens):
 
     idx = start + done_count
     if idx >= len(tokens):
+      report()
       return True
 
     tok = tokens[idx]
@@ -2132,11 +2193,31 @@ def click_scramble_in_order(driver, tokens):
       time.sleep(0.05)
       continue
 
-    # 한 번 실패한 낱말은 반대 방식으로 바꿔 본다.
-    flip = retries.get(tok, 0) > 0
+    if in_test:
+      # 이미 채점된 카드(정답/오답)면 더 누르지 않는다. 그 카드 조각은
+      # 클릭을 안 받는다(pointer-events: none).
+      try:
+        judged = driver.execute_script(
+            "var c = arguments[0].closest('.flip-card');"
+            "if (!c) return '';"
+            "return c.classList.contains('correct') ? 'correct'"
+            " : (c.classList.contains('wrong') ? 'wrong' : '');", target)
+      except Exception:
+        judged = ''
+      if judged:
+        print(f'[DEBUG] 이 카드는 이미 채점됨({judged}) - 조각 누르기 중단')
+        report()
+        return judged == 'correct'
+
+    # 한 번 실패한 낱말은 반대 방식으로 바꿔 본다. (테스트는 JS 클릭이
+    # 무시되므로 바꾸지 않는다)
+    flip = retries.get(tok, 0) > 0 and not in_test
     if not click_chip(
-        driver, target, native_first=native_click != flip, debug=flip
+        driver, target, native_first=native_click != flip, debug=flip,
+        allow_js=not in_test,
     ):
+      need_stable = True
+      time.sleep(0.1)
       continue
 
     used.append(target)
@@ -2147,8 +2228,27 @@ def click_scramble_in_order(driver, tokens):
     #  2) 문장 줄에 그 낱말까지 채워졌다
     # 화면마다 다 쓴 조각을 표시하는 방식이 달라서 둘 다 본다.
     landed = False
+    t_click = time.time()
+    # 누른 직후 바로 확인하면 트레이가 다시 그려지는 중이라 '빠졌다'로
+    # 잘못 보고, 다음 조각을 너무 빨리 눌러 순서가 꼬였다(조각당 0.03초,
+    # 전부 오답). 예전처럼 조금 기다린 뒤 확인한다.
     for _ in range(12):
       time.sleep(0.03)
+      # 1) 누른 조각에 'clicked'가 붙었으면 확실히 눌린 것이다. 테스트에서
+      #    조각 줄의 마지막 조각을 누르면 남은 조각이 없어져 '묶음을 못
+      #    찾음'이 되는 바람에 눌린 걸 확인 못 하고 같은 조각을 다시 눌렀다.
+      #    테스트는 이미 누른 조각을 또 누르면 오답(시간 차감)이다.
+      try:
+        if driver.execute_script(
+            "return arguments[0].classList.contains('clicked');", target):
+          landed = True
+          break
+      except StaleElementReferenceException:
+        # 눌린 뒤 조각 줄이 새로 그려져 요소가 사라졌다 = 눌린 것.
+        landed = True
+        break
+      except Exception:
+        pass
       group = _pick_group_for(read_scramble_groups(driver), tokens)
       # 묶음을 아예 못 찾은 상태를 '빠졌다'로 보면 안 된다. 엉뚱한 요소를
       # 조각으로 잡던 시절, 이것 때문에 안 눌린 것을 눌린 걸로 착각했다.
@@ -2159,6 +2259,17 @@ def click_scramble_in_order(driver, tokens):
         landed = True
         break
 
+    landed_waits.append(time.time() - t_click)
+    if len(items) <= 1 or not landed:
+      # 줄의 마지막 조각이었거나 실패했다 - 다음 줄이 새로 그려질 수 있다.
+      need_stable = True
+    if landed and flip and page != '/classtest/':
+      # (테스트는 아직 확인 전이라 원래 동작 그대로 둔다)
+      # 바꿔 본 방식이 먹혔다. 이 화면에서는 앞으로 그 방식을 먼저 쓴다.
+      native_click = not native_click
+      _chip_click_native[page] = native_click
+      retries.clear()
+      print(f"[DEBUG] 이 화면은 {'셀레니움' if native_click else 'JS'} 클릭이 먹힘 - 앞으로 이걸 먼저 씀")
     if not landed:
       retries[tok] = retries.get(tok, 0) + 1
       if retries[tok] > 3:
@@ -2168,6 +2279,7 @@ def click_scramble_in_order(driver, tokens):
       used.pop()
       done_count -= 1
     elif done_count >= needed:
+      report()
       return True
 
     time.sleep(0.04)
@@ -2176,8 +2288,53 @@ def click_scramble_in_order(driver, tokens):
   return False
 
 
+def _press_next_question_when_ready(driver, timeout=2.0):
+  """테스트의 [다음 문제] 버튼이 뜨면 바로 눌러 넘긴다. 눌렀으면 True.
+
+  timeout 동안 0.05초 간격으로 기다린다(0이면 한 번만 본다). 클릭이 안
+  먹으면 ENTER(버튼에 붙은 단축키)를 보낸다."""
+  end = time.time() + timeout
+  while True:
+    btn = find_button_by_text(driver, _NEXT_CARD_LABELS)
+    if btn:
+      print('[DEBUG] 다음 문제 버튼 감지 - 바로 누름')
+      try:
+        btn.click()
+      except Exception:
+        pass
+      time.sleep(0.12)
+      if find_button_by_text(driver, _NEXT_CARD_LABELS):
+        press_submit(driver)
+        time.sleep(0.1)
+      return True
+    if not is_running or time.time() >= end:
+      return False
+    time.sleep(0.05)
+
+
+_UNARRANGED_WARNING_JS = r"""
+// '아직 배열하지 않은 단어가 있습니다' 확인창이 화면에 떠 있는지.
+var nodes = document.querySelectorAll('body *');
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  if (el.children.length) continue;
+  if ((el.textContent || '').indexOf('배열하지 않은') === -1) continue;
+  var r = el.getBoundingClientRect();
+  if (r.width > 0 && r.height > 0) return true;
+}
+return false;
+"""
+
+
+def _unarranged_warning_visible(driver):
+  try:
+    return bool(driver.execute_script(_UNARRANGED_WARNING_JS))
+  except Exception:
+    return False
+
+
 # --- 문장 암기(영작 연습) 자동 풀이 스레드 ---
-def sentence_scramble_worker():
+def sentence_scramble_worker(mode_name='문장'):
   global is_running, shared_driver
   is_running = True
 
@@ -2193,7 +2350,7 @@ def sentence_scramble_worker():
     root.after(
         0,
         lambda: lbl_status.config(
-            text='크롬에서 문장 학습 화면으로 이동하세요.',
+            text=f'브라우저 준비 중... {mode_name} 학습 화면으로 이동하세요',
             fg='#0288D1',
         ),
     )
@@ -2207,9 +2364,26 @@ def sentence_scramble_worker():
       # 눌러도 아무 반응이 없다. 보이면 [취소]로 닫고 다시 시작한다.
       # 이 확인창은 테스트 화면에만 있다 - 다른 화면에서까지 '취소'를
       # 찾으면 엉뚱한 버튼을 누를 수 있으므로 주소로 제한한다.
-      if on_class_test(driver) and click_button_by_text(
-          driver, _CANCEL_LABELS, wait_after=0.4
-      ):
+      # 단, 테스트 시작 화면의 '응시하시겠습니까?/새로 시작할까요?' 창에도
+      # [취소]가 있어서, 사용자가 테스트를 시작하려 할 때마다 매크로가
+      # [취소]를 눌러 창을 닫아버렸다. 그 확인창 문구가 보일 때만 누른다.
+      if (on_class_test(driver) and _unarranged_warning_visible(driver)
+          and click_button_by_text(driver, _CANCEL_LABELS, wait_after=0.4)):
+        solved_key = None
+        continue
+
+      # 세트/구간 완료 화면('리콜 200% 완료' + [300% 도전], [다음 구간으로
+      # 이동])이면 먼저 넘긴다. 예전엔 조각이 안 보일 때만 이걸 봤는데, 완료
+      # 화면 뒤에 지난 카드 조각이 남아 있으면 그걸 문제로 착각해서 완료
+      # 버튼을 끝내 안 눌렀다.
+      if handle_section_done(driver):
+        solved_key = None
+        continue
+
+      # 테스트는 채점이 끝나면 'Good Job!'/오답 표시와 [다음 문제](ENTER)가
+      # 뜬다. 그 카드 조각은 화면에 그대로 남아 있어서, 조각부터 보면 다시
+      # 풀려고 헛돈다. 다음 문제 버튼을 먼저 본다.
+      if on_class_test(driver) and _press_next_question_when_ready(driver, 0):
         solved_key = None
         continue
 
@@ -2226,7 +2400,7 @@ def sentence_scramble_worker():
             print('[DEBUG] 영작 연습하기 화면 - 스페이스로 문제 열기')
             open_logged = True
           press_space(driver)
-          time.sleep(0.55)
+          time.sleep(0.4)  # 사용자 요청으로 살짝 빠르게 (0.55 -> 0.4)
           continue
         open_logged = False
         if handle_section_done(driver):
@@ -2238,7 +2412,7 @@ def sentence_scramble_worker():
         root.after(
             0,
             lambda: lbl_status.config(
-                text='문장 학습 화면을 기다리는 중...', fg='gray'
+                text=f'{mode_name} 학습 화면을 기다리는 중...', fg='gray'
             ),
         )
         time.sleep(0.3)
@@ -2279,9 +2453,22 @@ def sentence_scramble_worker():
                 text=f"'{t}' 완성! 다음 문장 이동", fg='#388E3C'
             ),
         )
-        time.sleep(0.2)
-        press_submit(driver)
-        time.sleep(0.45)
+        # 사용자 요청으로 살짝 빠르게 (0.2/0.45 -> 0.1/0.35). 테스트는 아직
+        # 실제로 확인을 안 해서 원래 값 그대로 둔다.
+        in_test = on_class_test(driver)
+        if in_test:
+          # 테스트는 다 맞추면 사이트가 알아서 채점하고 [다음 문제](ENTER)를
+          # 띄운다. 예전엔 ENTER 한 번 + 0.45초 쉬고 다음 반복에서 버튼을
+          # 찾느라 살짝 늦었다. 버튼이 뜨는 순간을 0.05초 간격으로 지켜보다가
+          # 바로 누른다(최대 2초, 안 뜨면 예전처럼 ENTER).
+          # 먼저 ENTER(제출)를 보내 바로 채점되게 하고(사이트가 스스로
+          # 채점하려면 0.8초를 기다린다), 곧이어 뜨는 [다음 문제]를 누른다.
+          press_submit(driver)
+          _press_next_question_when_ready(driver, timeout=2.0)
+        else:
+          time.sleep(0.1)
+          press_submit(driver)
+          time.sleep(0.35)
       else:
         time.sleep(0.5)
 
@@ -2305,6 +2492,7 @@ def on_kind_change():
   암기만 완전히 다르다 - 단어는 카드 넘기기(PyAutoGUI), 문장은 낱말을
   순서대로 클릭하는 영작 연습이다."""
   is_sentence = study_kind.get() == 'sentence'
+  chosen = study_kind.get() in ('word', 'sentence')
 
   # 어느 쪽이 켜져 있는지 한눈에 보이도록 색/눌린 모양까지 바꾼다.
   # (라디오버튼 기본 표시는 회색 배경이라 구분이 잘 안 됐다)
@@ -2312,10 +2500,10 @@ def on_kind_change():
     if value == study_kind.get():
       button.config(
           relief='sunken',
-          bg='#6A1B9A',
+          bg='#D32F2F',
           fg='white',
-          selectcolor='#6A1B9A',
-          activebackground='#6A1B9A',
+          selectcolor='#D32F2F',
+          activebackground='#D32F2F',
           activeforeground='white',
       )
     else:
@@ -2328,6 +2516,18 @@ def on_kind_change():
           activeforeground='#333333',
       )
 
+  if not chosen:
+    # 단어/문장을 고르기 전에는 아무것도 못 누르게 한다.
+    for b in (btn_load, btn_start, btn_memo_go, btn_recall_start,
+              btn_spell_start, btn_test_start):
+      b.config(state=tk.DISABLED)
+    lbl_status.config(text='먼저 왼쪽 위에서 [단어] 또는 [문장]을 고르세요', fg='#6A1B9A')
+    return
+  if not is_running:
+    btn_load.config(state=tk.NORMAL)
+    if lbl_status.cget('text').startswith('먼저 왼쪽 위에서'):
+      lbl_status.config(text='1. 북마크 추출 -> 2. [불러오기] -> 모드 선택', fg='gray')
+
   frame_memo.config(text=' 암기 (영작 연습) ' if is_sentence else ' 암기 ')
   # [시작] 버튼은 단어 암기에만 필요하다. 영작 연습은 조각이 보이면 바로
   # 풀기 시작하므로 숨긴다.
@@ -2338,7 +2538,7 @@ def on_kind_change():
   btn_start.config(
       text='영작 연습 시작' if is_sentence else '암기 시작',
       width=23 if is_sentence else 15,
-      command=run_sentence_scramble if is_sentence else start_macro,
+      command=(lambda: run_sentence_scramble('영작 연습')) if is_sentence else start_macro,
   )
 
   # 문장 단어장은 리콜(듣고 배열)도 스펠도 낱말을 순서대로 누르는 방식이라
@@ -2346,25 +2546,22 @@ def on_kind_change():
   frame_recall.config(text=' 리콜 (듣고 배열) ' if is_sentence else ' 리콜 ')
   btn_recall_start.config(
       text='리콜 자동 풀이 시작',
-      command=run_sentence_scramble if is_sentence else run_recall_selenium,
+      command=(lambda: run_sentence_scramble('리콜')) if is_sentence else run_recall_selenium,
   )
 
   frame_spell.config(text=' 스펠 (배열) ' if is_sentence else ' 스펠 ')
   btn_spell_start.config(
       text='스펠 자동 풀이 시작',
-      command=run_sentence_scramble if is_sentence else run_spelling_selenium,
+      command=(lambda: run_sentence_scramble('스펠')) if is_sentence else run_spelling_selenium,
   )
 
-  # 문장 테스트도 어순배열이지만, 조각 클릭이 아직 안정적이지 않아 막아둔다.
-  # (문장 단어장을 받을 수 없어 확인을 못 한 상태)
-  frame_test.config(text=' 테스트 (준비 중) ' if is_sentence else ' 테스트 ')
-  if is_sentence:
-    test_state = tk.DISABLED
-  else:
-    test_state = tk.NORMAL if (word_list and not is_running) else tk.DISABLED
+  # 문장 테스트(어순배열)도 같은 워커. 선생님이 문장 세트를 다시 올려줘서
+  # 다시 켜고 확인 중이다.
+  frame_test.config(text=' 테스트 (어순배열) ' if is_sentence else ' 테스트 ')
+  test_state = tk.NORMAL if (word_list and not is_running) else tk.DISABLED
   btn_test_start.config(
-      text='문장 테스트는 준비 중' if is_sentence else '테스트 자동 풀이 시작',
-      command=run_sentence_scramble if is_sentence else run_test_selenium,
+      text='테스트 자동 풀이 시작',
+      command=(lambda: run_sentence_scramble('테스트')) if is_sentence else run_test_selenium,
       state=test_state,
   )
 
@@ -2438,7 +2635,10 @@ root.wm_attributes('-topmost', True)
 root.bind('<Escape>', stop_macro)
 
 # 단어 단어장 / 문장 단어장 전환 (왼쪽 위)
-study_kind = tk.StringVar(value='word')
+# 처음엔 아무것도 안 골라진 상태다. 예전엔 [단어]가 미리 켜져 있어서 문장
+# 단어장인데 그대로 돌리는 등 헷갈렸다. 하나를 고르기 전에는 다른 버튼을
+# 전부 막아둔다(on_kind_change).
+study_kind = tk.StringVar(value='')
 kind_buttons = {}
 frame_kind = tk.Frame(root)
 if SENTENCE_MODE_ENABLED:
@@ -2454,6 +2654,8 @@ for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
       bd=2,
       pady=4,
       font=('맑은 고딕', 10, 'bold'),
+      # 변수 값이 ''일 때 Tk가 '반쯤 선택됨' 모양으로 그리지 않게 한다.
+      tristatevalue='x',
       command=lambda: on_kind_change(),
   )
   _btn.pack(side='left', padx=(0, 6))
@@ -2589,6 +2791,8 @@ btn_stop = tk.Button(
 )
 btn_stop.pack(pady=(4, 12))
 
-on_kind_change()  # 시작 시 [단어] 기준으로 암기 버튼 맞춰두기
+if not SENTENCE_MODE_ENABLED:
+  study_kind.set('word')
+on_kind_change()
 
 root.mainloop()
