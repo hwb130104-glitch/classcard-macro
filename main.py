@@ -1,6 +1,10 @@
 import ctypes
 import json
+import os
 import re
+import socket
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -29,9 +33,28 @@ except Exception:
 is_running = False
 word_list = []
 shared_driver = None
+# 문장 단어장 모드(왼쪽 위 [단어]/[문장] 전환). 지금은 문장 단어장을 받을 수
+# 없어 확인이 안 되므로 숨겨둔다. 다시 쓸 때 True로 바꾸면 된다.
+SENTENCE_MODE_ENABLED = False
+# 암기: 사용자가 사이트에서 학습을 시작한 뒤 [시작] 버튼을 눌러야 키를 보낸다.
+memo_go = threading.Event()
 
 
 # --- 모드 전환마다 새 크롬을 띄우지 않고 하나를 계속 재사용 ---
+# 매크로가 띄운 크롬에 고정 포트로 원격 조종 창구를 열어둔다. 프로그램만
+# 재시작했을 때 새 프로그램이 이 포트로 기존 크롬에 다시 붙는다(로그인 유지).
+_CHROME_DEBUG_PORT = 9333
+
+
+def _chrome_debug_port_open():
+  """매크로가 띄운 크롬이 아직 살아 있는지 포트로 빠르게 확인한다."""
+  try:
+    with socket.create_connection(('127.0.0.1', _CHROME_DEBUG_PORT), timeout=0.3):
+      return True
+  except OSError:
+    return False
+
+
 def get_driver():
   global shared_driver
 
@@ -42,8 +65,25 @@ def get_driver():
     except Exception:
       shared_driver = None  # 창이 닫혔으면 새로 띄운다
 
+  # [재시작]으로 프로그램만 새로 떴다면, 이미 떠 있는 크롬에 다시 붙는다.
+  # 포트를 먼저 확인하는 건, 크롬이 없을 때 연결을 시도하면 한참 기다리다
+  # 실패하기 때문이다.
+  if _chrome_debug_port_open():
+    try:
+      attach = ChromeOptions()
+      attach.add_experimental_option(
+          'debuggerAddress', f'127.0.0.1:{_CHROME_DEBUG_PORT}'
+      )
+      shared_driver = ChromeDriver(options=attach)
+      print('[DEBUG] 기존 크롬 창에 다시 연결')
+      return shared_driver
+    except Exception as e:
+      print(f'[DEBUG] 기존 크롬 연결 실패, 새로 띄움: {str(e).splitlines()[0][:80]}')
+      shared_driver = None
+
   options = ChromeOptions()
   options.add_experimental_option('detach', True)
+  options.add_argument(f'--remote-debugging-port={_CHROME_DEBUG_PORT}')
   shared_driver = ChromeDriver(options=options)
   shared_driver.get('https://www.classcard.net')
   return shared_driver
@@ -124,11 +164,10 @@ def memo_worker():
     )
 
     ready = False
+    waiting_go = False
+    memo_go.clear()
 
     while is_running:
-      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
-      focus_study_tab(driver)
-
       # 구간이 끝나 완료 화면이 떠 있으면 먼저 다음 구간으로 넘긴다.
       if handle_section_done(driver):
         continue
@@ -136,9 +175,17 @@ def memo_worker():
       # 암기 학습 화면에 들어왔을 때만 키를 보낸다. 로그인하고 학습
       # 화면까지 들어가는 동안은 조용히 기다린다.
       if not on_memorize_screen(driver):
-        if ready:
+        # 다른 탭에 암기 화면이 열려 있으면 그 탭으로 옮긴다.
+        if focus_study_tab(driver, _MEMORIZE_URL_HINT) and on_memorize_screen(
+            driver
+        ):
+          continue
+        if ready or waiting_go:
           print('[DEBUG] 암기 화면을 벗어남 - 다시 대기')
           ready = False
+          waiting_go = False
+          memo_go.clear()
+          root.after(0, lambda: btn_memo_go.config(state=tk.DISABLED))
         root.after(
             0,
             lambda: lbl_status.config(
@@ -149,23 +196,26 @@ def memo_worker():
         continue
 
       if not ready:
-        # 주소가 바뀌어도 사이트에서 [시작]을 눌러야 학습이 시작된다.
-        # 그 사이에 키를 보내면 엉뚱한 곳에 들어가므로 5초를 세고 시작한다.
-        print('[DEBUG] 암기 화면 감지 - 5초 후 시작')
-        for remain in range(5, 0, -1):
-          if not is_running or not on_memorize_screen(driver):
-            break
-          root.after(
-              0,
-              lambda r=remain: lbl_status.config(
-                  text=f'{r}초후 시작', fg='#1976D2'
-              ),
-          )
-          time.sleep(1)
-
-        if not is_running or not on_memorize_screen(driver):
+        # 주소가 바뀌어도 사이트에서 [시작]을 눌러야 학습이 시작된다. 그
+        # 사이에 키를 보내면 엉뚱한 곳에 들어가므로, 사용자가 준비됐다고
+        # 매크로의 [시작] 버튼을 누를 때까지 기다린다. (예전엔 5초를 셌는데
+        # 타이밍이 안 맞으면 불편해서 버튼으로 바꿨다)
+        if not memo_go.is_set():
+          if not waiting_go:
+            print('[DEBUG] 암기 화면 감지 - [시작] 버튼 대기')
+            waiting_go = True
+            root.after(0, lambda: btn_memo_go.config(state=tk.NORMAL))
+            root.after(
+                0,
+                lambda: lbl_status.config(
+                    text='사이트에서 학습을 시작한 뒤 [시작]을 누르세요.',
+                    fg='#1976D2',
+                ),
+            )
+          time.sleep(0.1)
           continue
 
+        waiting_go = False
         ready = True
         root.after(
             0,
@@ -207,6 +257,12 @@ def memo_worker():
     )
   finally:
     root.after(0, stop_macro)
+
+
+def memo_go_pressed():
+  """[시작] 버튼: 암기 화면에서 기다리던 매크로를 출발시킨다."""
+  memo_go.set()
+  btn_memo_go.config(state=tk.DISABLED)
 
 
 def start_macro():
@@ -479,16 +535,35 @@ _CLASS_TEST_URL_HINT = '/classtest/'
 _STUDY_URL_HINTS = ('/memorize/', '/recall/', '/spell/', '/classtest/')
 
 
-def focus_study_tab(driver):
+def focus_study_tab(driver, hint=None):
   """학습 화면이 열려 있는 탭으로 옮긴다.
 
   셀레니움은 처음 잡은 탭만 들여다본다. 사용자가 새 탭에서 학습 화면을 열면
   매크로는 엉뚱한 탭을 보며 '화면을 기다리는 중'만 반복한다(화면에는 문제가
-  멀쩡히 떠 있는데 아무것도 못 읽는 증상). 지금 탭이 학습 화면이 아니면
-  열려 있는 탭들을 훑어서 학습 화면인 탭으로 옮긴다."""
+  멀쩡히 떠 있는데 아무것도 못 읽는 증상).
+
+  hint를 주면 그 학습 종류의 탭만 찾는다. 탭을 여러 개 열어두면 지난
+  학습 탭이 먼저 걸려서 엉뚱한 화면을 붙들고 있을 수 있다.
+
+  탭 주소는 탭을 전환하지 않고 읽는다(Target.getTargets). 처음엔 탭을 하나씩
+  switch_to.window로 넘겨 가며 확인했는데, 그 호출이 최소화한 크롬 창을 매번
+  되살려서 창을 내려둘 수가 없었다(실험으로 확인: 클릭/키 입력/스크립트는
+  최소화를 유지하고 switch_to.window만 창을 복원한다). 이제는 정말 다른
+  탭으로 옮겨야 할 때 딱 한 번만 전환한다."""
+  wanted = (hint,) if hint else _STUDY_URL_HINTS
+
+  def matches(url):
+    low = (url or '').lower()
+    return any(h in low for h in wanted)
+
   try:
-    if any(h in (driver.current_url or '').lower() for h in _STUDY_URL_HINTS):
+    if matches(driver.current_url):
       return True
+  except Exception:
+    return False
+
+  try:
+    targets = driver.execute_cdp_cmd('Target.getTargets', {})
   except Exception:
     return False
 
@@ -497,16 +572,19 @@ def focus_study_tab(driver):
   except Exception:
     current = None
 
-  try:
-    for handle in driver.window_handles:
+  for info in targets.get('targetInfos', []):
+    if info.get('type') != 'page' or not matches(info.get('url')):
+      continue
+    handle = info.get('targetId')
+    if not handle or handle == current:
+      continue
+    try:
+      # 셀레니움 창 핸들은 이 targetId와 같다.
       driver.switch_to.window(handle)
-      if any(h in (driver.current_url or '').lower() for h in _STUDY_URL_HINTS):
-        print('[DEBUG] 학습 화면이 열린 탭으로 이동')
-        return True
-    if current:
-      driver.switch_to.window(current)
-  except Exception:
-    pass
+      print(f"[DEBUG] 학습 화면이 열린 탭으로 이동: {info.get('url')}")
+      return True
+    except Exception:
+      continue
   return False
 
 
@@ -681,9 +759,6 @@ def selenium_worker():
     last_logged_qtext = None
 
     while is_running:
-      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
-      focus_study_tab(driver)
-
       current_word = None
 
       # 1) 화면에 실제로 렌더링된 문제 요소만 읽는다(checkVisibility 기반).
@@ -756,6 +831,9 @@ def selenium_worker():
           )
           time.sleep(0.4)
       else:
+        # 다른 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다. 화면을 못 읽고
+        # 있을 때만 확인하므로 평소 속도에는 영향이 없다.
+        focus_study_tab(driver, '/recall/')
         # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
         if handle_section_done(driver):
           continue
@@ -824,9 +902,6 @@ def spelling_worker():
     last_logged_qtext = None
 
     while is_running:
-      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
-      focus_study_tab(driver)
-
       current_word = None
       current_word_el = None
 
@@ -905,6 +980,9 @@ def spelling_worker():
           )
           time.sleep(0.4)
       else:
+        # 다른 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다. 화면을 못 읽고
+        # 있을 때만 확인하므로 평소 속도에는 영향이 없다.
+        focus_study_tab(driver, '/spell/')
         # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
         if handle_section_done(driver):
           continue
@@ -933,6 +1011,374 @@ def spelling_worker():
 
   if is_running:
     stop_macro()
+
+
+_ON_SCREEN_JS = r"""
+// 셀렉터에 맞는 요소 중 '지금 실제로 화면에 떠 있는 것'만 돌려준다.
+// checkVisibility는 화면 밖으로 밀려난 카드나 다른 카드 뒤에 깔린 카드도
+// 보인다고 판정한다. 테스트 화면은 다음 카드들을 미리 그려두는데, 그 카드의
+// 문제/보기를 읽고 클릭하는 바람에 실제 화면에선 아무 일도 안 일어났다.
+// 그래서 (1) 요소 가운데가 창 안에 있고 (2) 그 지점에서 맨 위에 있는 요소가
+// 이 요소 자신이거나 그 안팎(부모/자식)일 때만 화면에 떠 있다고 본다.
+function clippedAway(el, cx, cy) {
+  // 부모 중 overflow로 내용을 자르는 상자가 있고, 요소 가운데가 그 상자 밖이면
+  // 실제로는 안 보이는 것이다(옆에 대기 중인 다음 카드가 이렇게 숨어 있다).
+  for (var a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+    var cs = getComputedStyle(a);
+    if (/(hidden|clip|scroll|auto)/.test(cs.overflow + cs.overflowX + cs.overflowY)) {
+      var ar = a.getBoundingClientRect();
+      if (cx < ar.left || cx > ar.right || cy < ar.top || cy > ar.bottom) return true;
+    }
+  }
+  return false;
+}
+
+function hitOk(el, cx, cy) {
+  var hit = document.elementFromPoint(cx, cy);
+  if (!hit) return false;
+  if (hit === el || el.contains(hit)) return true;
+  // 부모가 맞은 경우는 인정하되 body/html은 안 된다. 아무것도 안 그려진
+  // 자리(잘린 영역)에서는 body가 맞는데, body는 모든 요소를 품고 있어서
+  // 이걸 인정하면 가려진 카드까지 통과해버렸다.
+  return hit !== document.body && hit !== document.documentElement &&
+         hit.contains(el);
+}
+
+var sel = arguments[0];
+var hitTest = arguments[1] !== false;
+var W = window.innerWidth || document.documentElement.clientWidth;
+var H = window.innerHeight || document.documentElement.clientHeight;
+var out = [];
+var nodes = document.querySelectorAll(sel);
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  if (typeof el.checkVisibility === 'function') {
+    try {
+      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+    } catch (e) {}
+  }
+  var r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) continue;
+  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (cx < 0 || cx > W || cy < 0 || cy > H) continue;
+  if (clippedAway(el, cx, cy)) continue;
+  if (hitTest && !hitOk(el, cx, cy)) continue;
+  var t = (el.textContent || '').trim();
+  if (t) out.push({el: el, text: t});
+}
+return out;
+"""
+
+
+def read_on_screen(driver, selector, hit_test=True):
+  """read_visible과 같지만, 화면 밖/다른 카드 뒤에 깔린 요소까지 걸러낸다.
+
+  hit_test=False면 '창 안에 있는지'만 본다. 테스트 화면의 문제 단어는 위에
+  투명한 층이 덮여 있는지 '그 자리 맨 위 요소' 검사를 통과하지 못해서, 눈앞의
+  단어를 못 읽고 3초씩 기다렸다. 문제 단어는 뒤에 깔린 카드 것이 섞여도
+  뜬 보기로 진짜 문제를 다시 확정하므로 이 검사 없이 읽는다."""
+  try:
+    raw = driver.execute_script(_ON_SCREEN_JS, selector, bool(hit_test)) or []
+  except Exception:
+    return []
+  return [(d['el'], d['text']) for d in raw if d.get('text')]
+
+
+_QUESTION_WORD_JS = r"""
+// 테스트 단어 화면에서 지금 크게 떠 있는 단어를 찾는다.
+// F12로 확인해보니 화면의 단어(예: office)는 클래스가 하나도 없는 요소였다.
+// 매크로가 찾던 .cc-table...font- 요소는 카드 뒷면에 숨어 있는 복사본이라,
+// 단어 화면에선 못 찾고 보기로 뒤집힌 뒤에야 찾았다.
+// 그래서 클래스 대신 '화면에 실제로 보이는 글자 중 단어장에 있는 단어'를
+// 찾는다. 보기 칸(.cc-table.middle.fill-parent) 안의 글자는 뺀다.
+// 옆에 미리 대기 중인 다음 카드(예: actor)는 창 안에 있어도 실제로는 가려져
+// 있으므로, 그 자리 맨 위 요소 검사(hitTest)로 걸러낸다.
+function clippedAway(el, cx, cy) {
+  // 부모 중 overflow로 내용을 자르는 상자가 있고, 요소 가운데가 그 상자 밖이면
+  // 실제로는 안 보이는 것이다(옆에 대기 중인 다음 카드가 이렇게 숨어 있다).
+  for (var a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+    var cs = getComputedStyle(a);
+    if (/(hidden|clip|scroll|auto)/.test(cs.overflow + cs.overflowX + cs.overflowY)) {
+      var ar = a.getBoundingClientRect();
+      if (cx < ar.left || cx > ar.right || cy < ar.top || cy > ar.bottom) return true;
+    }
+  }
+  return false;
+}
+
+function hitOk(el, cx, cy) {
+  var hit = document.elementFromPoint(cx, cy);
+  if (!hit) return false;
+  if (hit === el || el.contains(hit)) return true;
+  // 부모가 맞은 경우는 인정하되 body/html은 안 된다. 아무것도 안 그려진
+  // 자리(잘린 영역)에서는 body가 맞는데, body는 모든 요소를 품고 있어서
+  // 이걸 인정하면 가려진 카드까지 통과해버렸다.
+  return hit !== document.body && hit !== document.documentElement &&
+         hit.contains(el);
+}
+
+var vocab = arguments[0] || {};
+var hitTest = arguments[1] !== false;
+var W = window.innerWidth || document.documentElement.clientWidth;
+var H = window.innerHeight || document.documentElement.clientHeight;
+var out = [];
+var nodes = document.querySelectorAll('body *');
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  if (el.children.length) continue;
+  var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 80) continue;
+  if (!vocab[t] && !vocab[t.toLowerCase()]) continue;
+  if (el.closest && el.closest('.cc-table.middle.fill-parent')) continue;
+  if (typeof el.checkVisibility === 'function') {
+    try {
+      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+    } catch (e) {}
+  }
+  var r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) continue;
+  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (cx < 0 || cx > W || cy < 0 || cy > H) continue;
+  if (clippedAway(el, cx, cy)) continue;
+  if (hitTest && !hitOk(el, cx, cy)) continue;
+  if (out.indexOf(t) === -1) out.push(t);
+}
+return out;
+"""
+
+
+def _test_vocab():
+  """_QUESTION_WORD_JS에 넘길 단어장 글자 모음 {글자: True}."""
+  vocab = {}
+  for w in word_list:
+    eng = (w.get('eng') or '').strip()
+    kor = (w.get('kor') or '').strip()
+    for key in (eng.lower(), kor, _strip_pos_tag(kor)):
+      if key:
+        vocab[key] = True
+  return vocab
+
+
+def read_question_words(driver, vocab, hit_test=True):
+  """테스트 단어 화면에 떠 있는 단어(단어장에 있는 것만)를 돌려준다."""
+  try:
+    return driver.execute_script(_QUESTION_WORD_JS, vocab, bool(hit_test)) or []
+  except Exception:
+    return []
+
+
+def _choice_digit(choice_el):
+  """보기를 감싼 <label for="radio_0_N">에서 N을 읽는다. 없으면 None.
+
+  단어장에 따라 이 번호 체계가 화면 번호와 안 맞는 경우가 있어서(보카클리어
+  테스트는 2x3 격자로 번호가 따로 붙어 있다) 보조 수단으로만 쓴다."""
+  try:
+    label_el = choice_el.find_element(By.XPATH, './ancestor::label[1]')
+    digit = (label_el.get_attribute('for') or '').rsplit('_', 1)[-1]
+    return digit if digit.isdigit() else None
+  except Exception:
+    return None
+
+
+_REFOCUS_JS = r"""
+// 키 입력이 페이지로 가도록 포커스만 정리한다. 예전엔 body를 클릭했는데,
+// 셀레니움 클릭은 요소 한가운데를 누르므로 보기 화면에서는 가운데 있는 보기
+// 칸이 눌려 엉뚱한 답이 골라질 수 있었다.
+var a = document.activeElement;
+if (a && a !== document.body && typeof a.blur === 'function') {
+  try { a.blur(); } catch (e) {}
+}
+window.focus();
+"""
+
+
+_CHOICE_TAKEN_JS = r"""
+// 보기가 실제로 선택됐는지 본다. 라디오가 체크됐거나, 보기 화면이 사라졌거나
+// (요소가 없어짐/안 보임/글자가 바뀜) 하면 선택된 것으로 본다.
+var el = arguments[0], txt = arguments[1];
+if (!el || !el.isConnected) return true;
+var l = el.closest ? el.closest('label') : null;
+if (l && l.control && l.control.checked) return true;
+if ((el.textContent || '').trim() !== txt) return true;
+if (typeof el.checkVisibility === 'function') {
+  try {
+    if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) return true;
+  } catch (e) {}
+}
+var r = el.getBoundingClientRect();
+return r.width <= 0 || r.height <= 0;
+"""
+
+
+def _choice_taken(driver, choice_el, text):
+  try:
+    return bool(driver.execute_script(_CHOICE_TAKEN_JS, choice_el, text))
+  except StaleElementReferenceException:
+    return True
+  except Exception:
+    return False
+
+
+def _select_test_choice(driver, choice_el, digit, text):
+  """테스트 보기를 고른다. 실제로 선택된 게 확인되면 True.
+
+  숫자 키가 기본이다. 화면 녹화로 확인해보니 보카클리어 테스트 화면은
+  셀레니움 클릭으로는 선택이 안 됐고(마우스가 올라간 표시만 뜨고 시간 초과),
+  번호 속성(radio_0_N)은 화면 번호와 정확히 맞았다(농부=6, 사무실=1).
+
+  예전엔 키를 누르기만 하고 성공으로 쳤다. 그런데 보기가 막 뜬 직후(카드가
+  뒤집히는 중)에 누르면 씹혀서, 로그는 '매칭성공=True'인데 실제로는 선택이
+  안 됐고 그 보기 화면이 남아 다음 문제 스페이스까지 줄줄이 안 먹었다.
+  그래서 누를 때마다 선택됐는지 확인하고, 안 됐으면 다시 누른다
+  (숫자키 3번 -> 클릭 -> JS클릭 -> 숫자키 순)."""
+  def digit_key():
+    if not digit:
+      raise ValueError('번호 속성 없음')
+    driver.execute_script(_REFOCUS_JS)
+    time.sleep(0.05)
+    ActionChains(driver).send_keys(digit).perform()
+    dispatch_key(driver, digit)
+
+  def native_click():
+    choice_el.click()
+
+  def js_click():
+    driver.execute_script(_CLICK_CHIP_JS, choice_el)
+
+  plan = [('숫자키', digit_key)] * 3 + [
+      ('클릭', native_click), ('JS클릭', js_click)] + [('숫자키', digit_key)] * 2
+  for n, (name, action) in enumerate(plan):
+    if not is_running:
+      return False
+    if _choice_taken(driver, choice_el, text):
+      return True
+    try:
+      action()
+    except StaleElementReferenceException:
+      return True
+    except Exception as e:
+      print(f'[DEBUG] 보기 {name} 실패: {str(e).splitlines()[0][:80]}')
+      continue
+    # 로그상 첫 번째 숫자키는 매번 씹히고(보기가 막 뜬 직후) 두 번째에 먹었다.
+    # 선택되면 라디오가 바로 체크되므로 오래 볼 필요 없이 0.25초만 보고
+    # 안 됐으면 바로 다시 누른다.
+    for _ in range(5):
+      time.sleep(0.05)
+      if _choice_taken(driver, choice_el, text):
+        if n:
+          print(f'[DEBUG] 보기 선택 확인 ({n + 1}번째 시도, {name})')
+        return True
+    print(f'[DEBUG] 보기 {name} 눌렀는데 선택 안 됨 ({n + 1}번째)')
+  return False
+
+
+_WAIT_WORD_SCREEN_JS = r"""
+// 답을 고른 뒤 '다음 단어 화면'이 뜨는 순간을 브라우저 안에서 5ms 간격으로
+// 지켜본다. 파이썬에서 0.1초마다 확인하던 것보다 훨씬 빨리 알아챈다.
+// 조건: 단어 칸(방금 푼 단어가 아닌 것)이 화면에 있고, 보기는 화면에 없음.
+var wordSel = arguments[0], choiceSel = arguments[1];
+var exclude = arguments[2] || [], timeoutMs = arguments[3] || 3000;
+var done = arguments[arguments.length - 1];
+function clippedAway(el, cx, cy) {
+  for (var a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+    var cs = getComputedStyle(a);
+    if (/(hidden|clip|scroll|auto)/.test(cs.overflow + cs.overflowX + cs.overflowY)) {
+      var ar = a.getBoundingClientRect();
+      if (cx < ar.left || cx > ar.right || cy < ar.top || cy > ar.bottom) return true;
+    }
+  }
+  return false;
+}
+function hitOk(el, cx, cy) {
+  var hit = document.elementFromPoint(cx, cy);
+  if (!hit) return false;
+  if (hit === el || el.contains(hit)) return true;
+  return hit !== document.body && hit !== document.documentElement && hit.contains(el);
+}
+function onScreen(sel, hitTest) {
+  var W = window.innerWidth || document.documentElement.clientWidth;
+  var H = window.innerHeight || document.documentElement.clientHeight;
+  var out = [], nodes = document.querySelectorAll(sel);
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    if (typeof el.checkVisibility === 'function') {
+      try {
+        if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+      } catch (e) {}
+    }
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    if (cx < 0 || cx > W || cy < 0 || cy > H) continue;
+    if (clippedAway(el, cx, cy)) continue;
+    if (hitTest && !hitOk(el, cx, cy)) continue;
+    var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
+// 같은 단어가 연달아 다시 출제되기도 한다(로그: scientist 두 번 -> 3초
+// 기다림). 그래서 보기가 사라진 뒤 0.25초가 지나도 방금 푼 단어만 보이면
+// 그 단어가 다시 나온 것으로 본다.
+var start = Date.now(), goneAt = 0;
+(function tick() {
+  try {
+    if (onScreen(choiceSel, true).length) {
+      goneAt = 0;
+    } else {
+      if (!goneAt) goneAt = Date.now();
+      var all = onScreen(wordSel, false);
+      var words = all.filter(function (t) { return exclude.indexOf(t) === -1; });
+      if (!words.length && all.length && Date.now() - goneAt > 250) words = all;
+      if (words.length) {
+        done({ok: true, words: words});
+        return;
+      }
+    }
+  } catch (e) {}
+  if (Date.now() - start > timeoutMs) { done({ok: false, words: []}); return; }
+  setTimeout(tick, 5);
+})();
+"""
+
+
+def wait_word_screen(driver, word_sel, choice_sel, exclude, timeout=3.0):
+  """다음 단어 화면이 뜰 때까지 기다린다. 뜨면 그 단어들, 아니면 None."""
+  try:
+    driver.set_script_timeout(timeout + 2)
+    res = driver.execute_async_script(
+        _WAIT_WORD_SCREEN_JS, word_sel, choice_sel, list(exclude),
+        int(timeout * 1000)) or {}
+  except Exception:
+    return None
+  return res.get('words') if res.get('ok') else None
+
+
+def press_space_now(driver):
+  """기다림 없이 바로 스페이스를 누른다."""
+  driver.execute_script(_REFOCUS_JS)
+  ActionChains(driver).send_keys(Keys.SPACE).perform()
+  dispatch_key(driver, ' ')
+
+
+def _build_test_candidates(texts, seen_keys):
+  """화면에서 읽은 문제 글자들을 [(글자, 단어, 방향, 정답), ...]으로 바꾼다.
+
+  이미 푼 문제와 단어장에 없는 글자는 뺀다. 영단어가 뜨면 한글 뜻을,
+  한글 뜻이 뜨면 영단어를 고르는 문제다(테스트는 중간에 방향이 바뀐다)."""
+  out = []
+  for text in texts:
+    cand = (text or '').strip()
+    if not cand or cand in seen_keys or any(cand == c[0] for c in out):
+      continue
+    for w in word_list:
+      if w['eng'].strip().lower() == cand.lower():
+        out.append((cand, w, 'eng_to_kor', w['kor'].strip()))
+        break
+      if _strip_pos_tag(w['kor']) == cand or w['kor'].strip() == cand:
+        out.append((cand, w, 'kor_to_eng', w['eng'].strip()))
+        break
+  return out
 
 
 def test_worker():
@@ -967,7 +1413,18 @@ def test_worker():
   CURRENT_CARD = '.flip-card:not(.next):not(.hidden)'
   FALLBACK_QUESTION_SELECTOR = '.cc-table.middle.fill-parent[class*="font-"]'
   QUESTION_SELECTOR = f'{CURRENT_CARD} {FALLBACK_QUESTION_SELECTOR}'
+  # 화면에 떠 있는지를 직접 확인할 때는 카드 클래스로 좁히지 않는다. 단어장에
+  # 따라(보카클리어) 단어 화면일 때는 그 카드에 '현재' 클래스가 아직 안 붙어
+  # 있어서, 좁히면 눈앞의 단어를 3초씩 못 읽었다. 화면 밖/뒤에 깔린 카드는
+  # read_on_screen이 따로 걸러낸다.
+  ON_SCREEN_QUESTION_SELECTOR = FALLBACK_QUESTION_SELECTOR
   CHOICE_SELECTOR = '.cc-table.middle.fill-parent:not([class*="font-"])'
+  # 사용자가 F12로 확인한 단어 화면의 단어 칸(클래스 없음, style만 있음):
+  # <div style="max-height: 406px; overflow: hidden; display: block;
+  #   text-align: center; height: 51px;">do a good job</div>
+  # 이게 화면에 떠 있고 보기가 없으면 '단어 확인 화면'이므로 바로 스페이스.
+  WORD_BOX_SELECTOR = 'div[style*="text-align: center"][style*="overflow: hidden"]'
+  SCOPED_CHOICE_SELECTOR = f'{CURRENT_CARD} {CHOICE_SELECTOR}'
 
   try:
     driver = get_driver()
@@ -980,14 +1437,20 @@ def test_worker():
     )
 
     seen_keys = set()
+    vocab = _test_vocab()
     fail_counts = {}
     last_logged_qtext = None
     empty_streak = 0
+    # 답을 고른 시각. 다음 문제에서 스페이스를 누르기까지 몇 초 걸렸는지
+    # 로그에 남겨서, 가끔 늦어질 때 어느 단계에서 막히는지 본다.
+    answered_at = None
+    stuck_streak = 0
+    # 답을 고른 뒤 다음 단어 화면을 바로 알아채서 이미 스페이스를 눌렀는지,
+    # 그때 화면에 떠 있던 단어들.
+    space_pressed_early = False
+    pending_words = []
 
     while is_running:
-      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
-      focus_study_tab(driver)
-
       current_word = None
       current_cand_norm = None
       direction = None  # 'eng_to_kor' 또는 'kor_to_eng'
@@ -1000,46 +1463,75 @@ def test_worker():
       # 안 보일 때마다 바로 백업 방식을 쓰면 미래 문제까지 한꺼번에 잡히는
       # 부작용이 있었으므로, 여러 번(약 1.5초) 연속으로 계속 비어있을 때만
       # 백업으로 가시성 판단 없이 원시 텍스트를 읽는다.
-      q_visible = read_visible(driver, QUESTION_SELECTOR)
-      q_candidates = [t for _, t in q_visible]
+      q_candidates = read_question_words(driver, vocab)
+      early_words = pending_words
+      if pending_words:
+        q_candidates = list(pending_words) + [
+            t for t in q_candidates if t not in pending_words]
+        pending_words = []
       if q_candidates:
         empty_streak = 0
       else:
         empty_streak += 1
-        if empty_streak >= 5:
-          # 현재 카드 범위로 못 찾으면(카드 클래스 구성이 예상과 다를 때)
-          # 마지막 수단으로 범위 제한 없이 다시 찾아본다.
-          q_candidates = read_all_texts(driver, QUESTION_SELECTOR)
+        # 화면에서 문제를 못 찾을 때의 백업. 가시성 판단 없이 읽어서 미리
+        # 그려진 다른 카드의 문제까지 끌려오지만, 스페이스를 누른 뒤 뜬 보기로
+        # 진짜 문제를 다시 확정하므로 틀린 답으로 이어지진 않는다. 테스트는
+        # 문제마다 제한 시간이 있어서 오래 기다리면 시간 초과가 나므로
+        # 짧게(약 0.6초) 기다린다.
+        if empty_streak >= 3:
+          if empty_streak == 3:
+            print('[DEBUG] 화면에서 문제를 못 찾아 백업 방식으로 읽음')
+          q_candidates = read_question_words(driver, vocab, hit_test=False)
           if not q_candidates:
-            q_candidates = read_all_texts(driver, FALLBACK_QUESTION_SELECTOR)
+            q_candidates = read_all_texts(driver, QUESTION_SELECTOR)
 
       if q_candidates != last_logged_qtext:
-        print(f"[DEBUG] 화면에 실제로 보이는 문제 텍스트들={q_candidates}")
+        since = f' (답 고른 뒤 {time.time() - answered_at:.1f}초)' if answered_at else ''
+        print(f"[DEBUG] 화면에 실제로 보이는 문제 텍스트들={q_candidates}{since}")
         last_logged_qtext = q_candidates
 
-      for cand in q_candidates:
-        cand_norm = cand.strip()
-        if not cand_norm or cand_norm in seen_keys:
-          continue
-        for w in word_list:
-          if w['eng'].strip().lower() == cand_norm.lower():
-            current_word = w
-            direction = 'eng_to_kor'
-            break
-          if _strip_pos_tag(w['kor']) == cand_norm or w['kor'].strip() == cand_norm:
-            current_word = w
-            direction = 'kor_to_eng'
-            break
-        if current_word:
-          current_cand_norm = cand_norm
-          break
+      # 문제 후보가 여럿 잡힐 수 있다(카드가 넘어가는 동안 다른 카드의 단어가
+      # 같이 보임). 여기서 하나로 정하지 않고 전부 모아뒀다가, 스페이스를
+      # 누른 뒤 실제로 뜬 보기를 보고 '정답이 그 보기 안에 있는 후보'를 진짜
+      # 문제로 확정한다. 예전엔 첫 후보를 바로 골라서, ['actor', '간호사']
+      # 중 '간호사'(미리 그려진 다른 카드)를 문제로 착각하고 'job'의 보기에서
+      # 'nurse'를 찾다가 시간을 다 썼다.
+      # 단어 칸에서 읽은 글자도 문제 후보에 더한다.
+      word_boxes = [
+          ' '.join(t.split()) for _, t in read_on_screen(driver, WORD_BOX_SELECTOR)
+      ]
+      for t in word_boxes:
+        if t not in q_candidates:
+          q_candidates = list(q_candidates) + [t]
 
-      if current_word and is_running:
-        target_answer = (
-            current_word['kor'].strip()
-            if direction == 'eng_to_kor'
-            else current_word['eng'].strip()
-        )
+      candidates = _build_test_candidates(q_candidates, seen_keys)
+      if early_words:
+        # 이미 스페이스를 눌렀으므로 그때 뜬 단어는 이미 푼 단어라도(같은 단어
+        # 재출제) 후보에 넣는다. 안 그러면 보기 화면에서 문제를 못 정해 멈춘다.
+        for c in _build_test_candidates(early_words, set()):
+          if not any(c[0] == x[0] for x in candidates):
+            candidates.insert(0, c)
+
+      # 단어 화면인데 '새' 단어를 못 찾고 방금 푼 단어만 보이는 경우가 있다
+      # (로그: 새 단어 옆에 방금 푼 단어가 늘 같이 잡힘 ['job', 'want']).
+      # 예전엔 이때 '아직 새 문제가 안 떴다'며 스페이스를 안 누르고 계속
+      # 기다렸다. 같은 단어가 시험에 다시 나올 때도 똑같이 멈췄다. 보기가 안
+      # 떠 있는데(=단어 화면) 잠깐(약 0.3초) 이러면, 푼 단어까지 후보에 넣고
+      # 스페이스를 누른다. 진짜 문제는 뜬 보기를 보고 다시 확정한다.
+      if candidates:
+        stuck_streak = 0
+      elif is_running:
+        stuck_streak += 1
+        # 단어 칸이 떠 있으면 기다리지 않고 바로, 아니면 약 0.3초 뒤에.
+        if (word_boxes or stuck_streak >= 3) and not read_on_screen(
+            driver, CHOICE_SELECTOR):
+          pool = q_candidates or read_question_words(driver, vocab, hit_test=False)
+          candidates = _build_test_candidates(pool, set())
+          if candidates:
+            print(f"[DEBUG] 새 단어를 못 찾아 이미 푼 단어 포함해서 진행: {pool}")
+
+      if candidates and is_running:
+        current_cand_norm, current_word, direction, target_answer = candidates[0]
         dir_label = '영단어->한글 뜻' if direction == 'eng_to_kor' else '한글 뜻->영단어'
         msg = f"단어 감지({dir_label}): 정답 '{target_answer}' 찾는 중"
         root.after(0, lambda m=msg: lbl_status.config(text=m, fg='#0288D1'))
@@ -1053,57 +1545,123 @@ def test_worker():
         # 문제가 뒤로 갈수록 DOM에 카드가 계속 쌓여 사이트 반응이 점점
         # 느려지는 것으로 보여, 클릭/키 입력 후 대기 시간과 재시도 횟수를
         # 넉넉하게 잡는다.
+        # 스페이스를 누르기 전에 이미 보이던 보기는 '이전 문제'의 것이다.
+        # 두 번째 단어부터 스페이스가 안 먹는 것처럼 보였던 원인이 이것 -
+        # 앞 카드가 넘어가는 동안 그 보기가 아직 화면에 남아 있어서, 스페이스를
+        # 누른 직후 그걸 '보기가 떴다'로 착각하고 번호를 눌렀다(실제로는 아직
+        # 단어 확인 화면). 이 사이트는 카드마다 요소를 따로 만들므로, 누르기
+        # 전 요소는 빼고 새로 나타난 보기만 본다.
+        # 단, 보카클리어 단어장은 다음 카드의 보기를 같은 칸에 글자만 바꿔서
+        # 띄운다(로그: nurse 직후 '이전 보기 6개 제외'인데 보기=[]만 25번).
+        # 그래서 칸이 같아도 글자가 바뀌었으면 새 보기로 본다.
+        # 앞 카드 보기가 아직 화면에 남아 있으면(카드가 넘어가는 중) 그게 다
+        # 사라질 때까지 기다렸다가 누른다. 로그상 매 카드 '이전 보기 3개 제외'
+        # 상태에서 누른 첫 스페이스가 씹혀서, 1초 뒤 재시도로 넘어갔다.
+        # 이미 스페이스를 눌렀으면 지금 뜬 보기가 새 보기이므로 기다리지 않는다.
+        stale = [] if space_pressed_early else read_on_screen(driver, CHOICE_SELECTOR)
+        waited = 0
+        while stale and waited < 20 and is_running:
+          time.sleep(0.05)
+          waited += 1
+          stale = read_on_screen(driver, CHOICE_SELECTOR)
+        if waited:
+          print(f"[DEBUG] 앞 카드 보기가 사라지길 {waited * 0.05:.2f}초 기다림 (남은 보기 {len(stale)}개)")
+
+        if answered_at:
+          print(f"[DEBUG] 스페이스 누름: 문제='{current_cand_norm}' "
+                f"(답 고른 뒤 {time.time() - answered_at:.1f}초)")
+          answered_at = None
         choices, attempt = [], 0
-        for space_try in range(3):
+        choice_scope = '-'
+        # 첫 스페이스가 씹히면 보기가 뜰 때까지 빠르게 연타한다(사용자 요청).
+        # 보기가 하나라도 뜨면 바로 멈추므로 보기 화면에서 더 누르지는 않는다.
+        # 최대 약 4초.
+        for space_try in range(25):
           if not is_running:
             break
-          driver.find_element(By.TAG_NAME, 'body').click()
-          time.sleep(0.15)
-          ActionChains(driver).send_keys(Keys.SPACE).perform()
-          dispatch_key(driver, ' ')
-          time.sleep(0.3)
+          # 페이지 가운데를 클릭하지 않고 포커스만 정리한다. 재시도할 때는
+          # 이미 보기 화면일 수 있는데, 그때 가운데를 클릭하면 보기가 눌린다.
+          if space_try or not space_pressed_early:
+            press_space_now(driver)
+          window = 0.35 if space_try == 0 else 0.12
+          t0 = time.time()
 
-          # 보기 6개가 화면에 실제로 렌더링될 때까지 최대 2.5초 재시도.
-          for attempt in range(25):
-            if not is_running:
+          # 새 보기가 화면에 렌더링될 때까지 최대 약 1초 기다린다. 보기는 보통
+          # 0.3초 안에 뜨는데, 스페이스가 씹힌 경우 2.5초씩 기다렸다가 다시
+          # 눌러서 한 번씩 너무 늦었다(로그: vet).
+          #
+          # 보기도 문제처럼 현재 카드 안에서 먼저 찾는다. 범위를 안 좁히면
+          # 미리 그려진 다른 카드의 보기를 먼저 잡는 일이 있었다('be proud
+          # of' 문제에 '엔지니어, 일하다, 디자이너...' 보기 5개를 읽음).
+          # 현재 카드에서 못 찾으면 범위 없이 찾는다.
+          #
+          # 또 읽은 보기에 정답이 없으면 바로 포기하지 않는다. 제대로 된
+          # 보기가 조금 늦게 뜨는 경우가 있어서, 정답이 보일 때까지 계속
+          # 다시 읽는다. (시간이 다 되면 그때 가진 보기로 판단한다)
+          attempt = -1
+          while True:
+            attempt += 1
+            if not is_running or time.time() - t0 > 1.0:
               break
-            choices = read_visible(driver, CHOICE_SELECTOR)
+            choices = []
+            for sel in (SCOPED_CHOICE_SELECTOR, CHOICE_SELECTOR):
+              choices = [
+                  (el, t)
+                  for el, t in read_on_screen(driver, sel)
+                  if not any(el == old_el and t == old_t for old_el, old_t in stale)
+              ]
+              if choices:
+                choice_scope = '현재카드' if sel == SCOPED_CHOICE_SELECTOR else '전체'
+                break
             if choices:
+              # 진짜 현재 문제가 이제서야 보일 수 있으므로 문제도 다시 읽는다.
+              more = _build_test_candidates(
+                  read_question_words(driver, vocab)
+                  + [t for _, t in read_on_screen(
+                      driver, ON_SCREEN_QUESTION_SELECTOR, hit_test=False)],
+                  seen_keys,
+              )
+              for m in more:
+                if not any(m[0] == c[0] for c in candidates):
+                  candidates.append(m)
+              if any(_pick_choice(choices, c[3]) for c in candidates):
+                break
+            elif time.time() - t0 > window:
+              # 보기는 보통 0.3초 안에 뜬다. 그 안에 하나도 안 떴으면 스페이스가
+              # 씹힌 것이니 바로 다시 누른다(이후로는 약 0.12초 간격 연타).
               break
-            time.sleep(0.1)
+            time.sleep(0.02)
 
           if choices or not is_running:
             break
-          print(f"[DEBUG] 보기 화면이 안 떠서 스페이스 재시도 ({space_try + 1}회차)")
+          if space_try == 0:
+            print("[DEBUG] 보기 화면이 안 떠서 스페이스 연타 시작")
+        space_pressed_early = False
+        if space_try:
+          print(f"[DEBUG] 스페이스 {space_try + 1}번 눌러서 보기 뜸" if choices
+                else f"[DEBUG] 스페이스 {space_try + 1}번 눌렀는데도 보기 안 뜸")
+
+        # 뜬 보기로 진짜 문제를 확정한다.
+        for c in candidates:
+          if _pick_choice(choices, c[3]):
+            if c[0] != current_cand_norm:
+              print(f"[DEBUG] 보기를 보고 문제를 '{current_cand_norm}' -> '{c[0]}'로 바로잡음")
+            current_cand_norm, current_word, direction, target_answer = c
+            break
 
         debug_texts = [t for _, t in choices]
         print(
             f"[DEBUG] target_answer='{target_answer}' / 화면에 보이는 보기들={debug_texts} "
-            f"(시도={attempt + 1}회)"
+            f"(시도={attempt + 1}회, 이전 보기 {len(stale)}개 제외, 범위={choice_scope})"
         )
 
         pressed = False
         picked = _pick_choice(choices, target_answer)
         if picked and is_running:
           _, choice_el, matched_text = picked
-          print(f"[DEBUG] 고른 보기='{matched_text}'")
-          try:
-            # 보기 각각은 <label for="radio_0_N">으로 감싸여 있고 N이 곧
-            # 눌러야 할 번호다. 위치를 세는 대신 이 속성에서 직접 읽으면
-            # DOM에 잔여 요소가 섞여 있어도 정확한 번호를 알 수 있다.
-            label_el = choice_el.find_element(By.XPATH, './ancestor::label[1]')
-            for_attr = label_el.get_attribute('for') or ''
-            digit = for_attr.rsplit('_', 1)[-1]
-            if digit.isdigit():
-              driver.find_element(By.TAG_NAME, 'body').click()
-              time.sleep(0.15)
-              ActionChains(driver).send_keys(digit).perform()
-              dispatch_key(driver, digit)
-              pressed = True
-          except StaleElementReferenceException:
-            pass
-          except Exception as e:
-            print('선택 에러:', e)
+          digit = _choice_digit(choice_el)
+          print(f"[DEBUG] 고른 보기='{matched_text}' (번호 속성={digit})")
+          pressed = _select_test_choice(driver, choice_el, digit, matched_text)
         print(f"[DEBUG] 매칭성공={pressed}")
 
         if pressed and is_running:
@@ -1116,7 +1674,25 @@ def test_worker():
                   fg='#388E3C',
               ),
           )
-          time.sleep(0.4)
+          # 고른 보기 화면이 사라질 때까지(최대 2초) 기다렸다가 다음 문제를
+          # 읽는다. 바로 넘어가면 아직 떠 있는 이 보기를 다음 문제의 '이전
+          # 보기'로 기억하거나, 사라지는 중인 화면에서 엉뚱한 글자를 문제로
+          # 읽었다(nurse 직후 '모델, 모형'을 문제로 착각).
+          #
+          # 이제는 브라우저 안에서 5ms 간격으로 '다음 단어 칸이 뜨고 보기는
+          # 사라졌는지' 지켜보다가, 뜨는 순간 바로 스페이스를 누른다(사용자
+          # 요청: 단어 칸을 알아채면 밀리초 단위로 바로). 3초 안에 안 뜨면
+          # 예전처럼 다음 반복에서 천천히 확인한다.
+          answered_at = time.time()
+          words = wait_word_screen(
+              driver, WORD_BOX_SELECTOR, CHOICE_SELECTOR, [current_cand_norm])
+          if words and is_running:
+            press_space_now(driver)
+            space_pressed_early = True
+            pending_words = words
+            print(f"[DEBUG] 단어 화면 감지 즉시 스페이스: {words} "
+                  f"(답 고른 뒤 {time.time() - answered_at:.2f}초)")
+            answered_at = None
         elif is_running:
           # 백업 방식(read_all_texts)이 아직 화면에 없는 미래 문제를 잘못
           # 집었을 때, 실패해도 처리 완료로 기록을 안 해두면 매번 같은
@@ -1128,6 +1704,10 @@ def test_worker():
             seen_keys.add(current_cand_norm)
             fail_counts.pop(current_cand_norm, None)
       else:
+        space_pressed_early = False
+        # 다른 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다. 화면을 못 읽고
+        # 있을 때만 확인하므로 평소 속도에는 영향이 없다.
+        focus_study_tab(driver, '/classtest/')
         # 구간 완료 화면이면 여기서 다음 구간으로 넘어간다.
         if handle_section_done(driver):
           continue
@@ -1143,7 +1723,8 @@ def test_worker():
             ),
         )
 
-      time.sleep(0.3)
+      if not space_pressed_early:
+        time.sleep(0.1)
 
   except Exception as e:
     err_msg = str(e)
@@ -1622,9 +2203,6 @@ def sentence_scramble_worker():
     open_logged = False
 
     while is_running:
-      # 사용자가 새 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다.
-      focus_study_tab(driver)
-
       # 덜 배열한 채 제출하면 확인창이 뜨고, 그게 떠 있는 동안은 조각을
       # 눌러도 아무 반응이 없다. 보이면 [취소]로 닫고 다시 시작한다.
       # 이 확인창은 테스트 화면에만 있다 - 다른 화면에서까지 '취소'를
@@ -1656,6 +2234,7 @@ def sentence_scramble_worker():
           continue
         if groups:
           print(f"[DEBUG] 조각은 보이는데 맞는 문장이 없음={[[t for _, t in g] for g in groups]}")
+        focus_study_tab(driver)
         root.after(
             0,
             lambda: lbl_status.config(
@@ -1750,6 +2329,12 @@ def on_kind_change():
       )
 
   frame_memo.config(text=' 암기 (영작 연습) ' if is_sentence else ' 암기 ')
+  # [시작] 버튼은 단어 암기에만 필요하다. 영작 연습은 조각이 보이면 바로
+  # 풀기 시작하므로 숨긴다.
+  if is_sentence:
+    btn_memo_go.pack_forget()
+  elif not btn_memo_go.winfo_ismapped():
+    btn_memo_go.pack(side='left')
   btn_start.config(
       text='영작 연습 시작' if is_sentence else '암기 시작',
       width=23 if is_sentence else 15,
@@ -1784,9 +2369,55 @@ def on_kind_change():
   )
 
 
+def restart_program():
+  """프로그램만 다시 시작한다. 크롬 창은 그대로 둔다(로그인 유지).
+
+  매크로가 꼬였을 때 창을 닫고 다시 여는 수고를 덜기 위한 것이다. 새로 뜬
+  프로그램은 get_driver()에서 고정 포트로 기존 크롬에 다시 붙는다.
+
+  크롬을 조종하던 chromedriver 프로세스만 정리한다. 그냥 종료하면
+  chromedriver가 주인 없이 남는다. (크롬은 detach로 띄웠으므로 같이 안 닫힌다)"""
+  global is_running, shared_driver
+  is_running = False
+  lbl_status.config(text='재시작 중...', fg='#D32F2F')
+  root.update()
+
+  if shared_driver is not None:
+    try:
+      shared_driver.service.stop()
+    except Exception:
+      pass
+    shared_driver = None
+
+  if getattr(sys, 'frozen', False):
+    # exe로 실행 중: sys.executable이 곧 암기.exe다.
+    args = [sys.executable] + sys.argv[1:]
+  else:
+    # python main.py로 실행 중. 경로를 절대경로로 바꿔 둬야 어느 폴더에서
+    # 실행했든 새 프로세스가 main.py를 찾는다.
+    args = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+
+  env = dict(os.environ)
+  # PyInstaller onefile exe가 자기 자신을 다시 띄우면, 새 프로세스가 지금
+  # 프로세스의 임시 압축해제 폴더를 물려받았다가 우리가 종료하며 그 폴더를
+  # 지우는 순간 죽는다. 이 값을 주면 새 프로세스가 처음부터 따로 시작한다.
+  env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+
+  try:
+    subprocess.Popen(args, env=env, close_fds=True)
+  except Exception as e:
+    messagebox.showerror('재시작 실패', f'다시 시작하지 못했습니다:\n{e}')
+    return
+
+  root.destroy()
+  os._exit(0)
+
+
 def stop_macro(event=None):
   global is_running
   is_running = False
+  memo_go.clear()
+  btn_memo_go.config(state=tk.DISABLED)
   lbl_status.config(text='정지됨', fg='#D32F2F')
   btn_load.config(state=tk.NORMAL)
   btn_start.config(state=tk.NORMAL if word_list else tk.DISABLED)
@@ -1810,7 +2441,8 @@ root.bind('<Escape>', stop_macro)
 study_kind = tk.StringVar(value='word')
 kind_buttons = {}
 frame_kind = tk.Frame(root)
-frame_kind.pack(anchor='w', padx=15, pady=(10, 0))
+if SENTENCE_MODE_ENABLED:
+  frame_kind.pack(anchor='w', padx=15, pady=(10, 0))
 for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
   _btn = tk.Radiobutton(
       frame_kind,
@@ -1827,6 +2459,16 @@ for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
   _btn.pack(side='left', padx=(0, 6))
   kind_buttons[_kind_value] = _btn
 
+# 오른쪽 위 재시작 버튼. 다른 위젯 배치에 영향을 안 주도록 place로 띄운다.
+btn_restart = tk.Button(
+    root,
+    text='재시작',
+    font=('맑은 고딕', 8),
+    fg='#555555',
+    command=restart_program,
+)
+btn_restart.place(relx=1.0, x=-10, y=8, anchor='ne')
+
 lbl_status = tk.Label(
     root,
     text='1. 북마크 추출 -> 2. [불러오기] -> 모드 선택',
@@ -1835,7 +2477,8 @@ lbl_status = tk.Label(
     wraplength=460,
     justify='center',
 )
-lbl_status.pack(pady=(10, 10))
+# 오른쪽 위 재시작 버튼과 겹치지 않도록 그 아래에서 시작한다.
+lbl_status.pack(pady=(36, 10))
 
 # 공통 불러오기 버튼
 frame_top = tk.Frame(root)
@@ -1856,8 +2499,11 @@ frame_memo = tk.LabelFrame(
 )
 frame_memo.pack(pady=8, padx=15, fill='x')
 
+frame_memo_row = tk.Frame(frame_memo)
+frame_memo_row.pack(pady=8)
+
 btn_start = tk.Button(
-    frame_memo,
+    frame_memo_row,
     text='암기 시작',
     width=15,
     font=('맑은 고딕', 9, 'bold'),
@@ -1865,7 +2511,20 @@ btn_start = tk.Button(
     command=start_macro,
     state=tk.DISABLED,
 )
-btn_start.pack(padx=12, pady=8)
+btn_start.pack(side='left', padx=(0, 6))
+
+# 암기 화면에 들어간 뒤 사이트에서 학습을 시작하고 누르는 버튼.
+# 매크로가 그 화면을 기다리는 동안에만 켜진다.
+btn_memo_go = tk.Button(
+    frame_memo_row,
+    text='시작',
+    width=6,
+    font=('맑은 고딕', 9, 'bold'),
+    fg='#1565C0',
+    command=memo_go_pressed,
+    state=tk.DISABLED,
+)
+btn_memo_go.pack(side='left')
 
 # 리콜 학습 모드 컨트롤 프레임
 frame_recall = tk.LabelFrame(
