@@ -1,6 +1,6 @@
 ﻿[Setup]
 AppName=클래스카드 매크로
-AppVersion=1.2.0
+AppVersion=1.1.5
 DefaultDirName={autopf}\ClasscardMacro
 DefaultGroupName=클래스카드 매크로
 OutputDir=.
