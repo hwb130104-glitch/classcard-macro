@@ -30,21 +30,6 @@
 
 ---
 
-## 🔖 처음 한 번만: 단어 복사 북마크 만들기
-
-프로그램이 정답을 알려면 단어장의 단어 목록이 필요합니다. 이걸 한 번에 복사해 주는 **북마크**를 만들어 둡니다.
-
-1. 크롬에서 `Ctrl + Shift + B`를 눌러 **북마크바**를 켭니다.
-2. 북마크바 빈 곳에 마우스 오른쪽 클릭 → **페이지 추가**
-3. **이름**: `단어추출` (아무거나 괜찮아요)
-4. **URL**: 아래 코드를 **전부** 복사해서 붙여넣고 저장합니다.
-
-```
-javascript:(function(){try{let sets=[];document.querySelectorAll('.flip-card').forEach(card=>{let eng=card.querySelector('.ex_front')?.innerText.trim();let kor=card.querySelector('.ex_back')?.innerText.trim();if(eng&&kor){sets.push({eng:eng,kor:kor});}});if(sets.length===0){alert('단어를 찾지 못했습니다. (0개) 페이지 구조가 다를 수 있어요.');return;}let jsonText=JSON.stringify(sets);function fallbackCopy(text){let ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();let ok=false;try{ok=document.execCommand('copy');}catch(e){ok=false;}document.body.removeChild(ta);return ok;}window.focus();navigator.clipboard.writeText(jsonText).then(()=>{alert('단어 '+sets.length+'개가 클립보드에 복사되었습니다!');}).catch(()=>{if(fallbackCopy(jsonText)){alert('단어 '+sets.length+'개가 클립보드에 복사되었습니다! (대체 방식)');}else{alert('클립보드 복사에 실패했습니다. (단어 '+sets.length+'개는 찾았음)');}});}catch(e){alert('오류 발생: '+e.message);}})();
-```
-
----
-
 ## ▶️ 사용법
 
 ### 0단계: 단어 / 문장 고르기 (매번)
@@ -56,9 +41,12 @@ javascript:(function(){try{let sets=[];document.querySelectorAll('.flip-card').f
 
 ### 1단계: 단어 불러오기 (매번)
 
-1. 클래스카드에서 공부할 **단어장 페이지**(단어 목록이 보이는 곳)를 엽니다.
-2. 북마크바의 **`단어추출`** 을 누릅니다. → "단어 ○개가 클립보드에 복사되었습니다!" 가 뜨면 성공
-3. 프로그램에서 **`클립보드 불러오기`** 를 누릅니다.
+1. 모드 버튼을 눌러 뜨는 **자동 조작용 크롬 창**에서 클래스카드에 로그인합니다.
+2. 공부할 **단어장(세트)** 을 엽니다. 세트 페이지든 학습 화면이든 괜찮습니다.
+3. 프로그램에서 **`단어 불러오기`** 를 누릅니다. → `준비 완료! ○○에서 ○개 불러옴` 이 뜨면 성공
+
+> 크롬에서 열어둔 세트를 그대로 읽어옵니다. 예전처럼 북마크로 복사할 필요가 없습니다.
+> 단어장 종류(단어/문장)도 자동으로 맞춰집니다.
 
 ### 2단계: 원하는 모드 실행
 
@@ -95,7 +83,7 @@ javascript:(function(){try{let sets=[];document.querySelectorAll('.flip-card').f
 
 ## ❓ 자주 묻는 질문
 
-- **"단어를 찾지 못했습니다 (0개)"가 떠요** → 학습 화면이 아니라 **단어 목록이 보이는 단어장 페이지**에서 북마크를 눌러야 합니다.
+- **"크롬에서 공부할 단어장을 먼저 열어주세요"가 떠요** → 크롬이 클래스 목록이나 다른 페이지에 있는 겁니다. 공부할 **세트**를 연 뒤에 다시 누르세요.
 - **정답을 못 고르고 가만히 있어요** → 단어를 그 단어장에서 불러왔는지 확인하세요. 다른 단어장의 단어를 불러오면 정답을 모릅니다.
 - **크롬 창을 닫아버렸어요** → 모드 버튼을 다시 누르면 새 창이 뜹니다.
 - **잘 안 되는 부분이 있어요** → [Issues](../../issues)에 어떤 모드에서 어떻게 안 되는지 올려주세요.
@@ -116,7 +104,8 @@ javascript:(function(){try{let sets=[];document.querySelectorAll('.flip-card').f
 
 - Python(Tkinter) GUI + Selenium(Chrome 자동 조작). 코드는 전부 `main.py` 하나에 있습니다.
 - 모든 모드가 Chrome 창 하나를 공유합니다. Chrome은 `--remote-debugging-port=9333`으로 띄우고, 프로그램을 재시작하면 그 포트로 기존 창에 다시 연결합니다.
-- 단어 데이터는 위 북마크릿이 만든 JSON(`[{"eng": ..., "kor": ...}, ...]`)을 클립보드에서 읽습니다.
+- 단어 데이터는 로그인된 크롬에서 세트 페이지(`/set/{세트}/{클래스}`)를 읽어 가져옵니다(`fetch_set_detail`). 주소로 세트를 못 알아내면 예전 방식(북마크릿이 만든 JSON을 클립보드에서 읽기)으로 넘어갑니다.
+- 클래스·세트 목록과 진도(`.mem-total-rate` 등)도 같은 방식으로 읽어서, `자동 학습` 창에서 고를 수 있습니다.
 
 ### 소스에서 실행
 

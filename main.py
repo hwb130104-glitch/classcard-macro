@@ -75,6 +75,7 @@ def get_driver():
           'debuggerAddress', f'127.0.0.1:{_CHROME_DEBUG_PORT}'
       )
       shared_driver = ChromeDriver(options=attach)
+      _keep_page_awake(shared_driver)
       print('[DEBUG] 기존 크롬 창에 다시 연결')
       return shared_driver
     except Exception as e:
@@ -84,12 +85,866 @@ def get_driver():
   options = ChromeOptions()
   options.add_experimental_option('detach', True)
   options.add_argument(f'--remote-debugging-port={_CHROME_DEBUG_PORT}')
+  # 크롬 창을 내리거나 다른 창에 가리면, 크롬은 그 창을 '안 보이는 창'으로
+  # 보고 화면 그리기를 멈춘다. 그러면 카드가 스르륵 나타나는 효과가 끝까지
+  # 안 돌아서 글자가 계속 '투명(opacity 0)' 상태로 남고, 매크로는 문제를
+  # 하나도 못 읽고 멈춘다. 아래 옵션들이 그걸 막아준다.
+  for flag in ('--disable-backgrounding-occluded-windows',
+               '--disable-renderer-backgrounding',
+               '--disable-background-timer-throttling'):
+    options.add_argument(flag)
   shared_driver = ChromeDriver(options=options)
+  _keep_page_awake(shared_driver)
   shared_driver.get('https://www.classcard.net')
   return shared_driver
 
 
+def _keep_page_awake(driver):
+  """창을 내려놔도 크롬이 화면을 계속 그리도록 부탁한다(안 되면 그냥 넘어간다)."""
+  try:
+    driver.execute_cdp_cmd('Emulation.setFocusEmulationEnabled', {'enabled': True})
+  except Exception:
+    pass
+
+
 # --- 클립보드에서 데이터 바로 읽기 ---
+# --- 사이트에서 클래스/세트/단어 읽어오기 (완전 자동화용) ---
+#
+# 예전에는 북마크릿으로 단어를 복사해 와야 했는데, 로그인된 크롬이 있으면
+# 세트 페이지에서 바로 읽을 수 있다. 클래스 목록과 세트 목록, 진도까지
+# 같은 방식으로 읽어서 프로그램 안에서 고를 수 있게 한다.
+_SITE = 'https://www.classcard.net'
+
+_CLASS_LIST_JS = r"""
+// 왼쪽 메뉴의 '나의 클래스' 목록.
+//
+// 링크 주소가 지금 보고 있는 화면에 따라 다르다. 클래스 화면에서는
+// /ClassMain/<번호>인데 '내 정보' 화면에서는 /ClassReports/<번호>다.
+// (이걸 몰라서 어떤 화면에서는 클래스를 하나도 못 읽었다.) 둘 다 본다.
+var out = [], seen = {};
+var skip = ['home', '세트', '설정', '리포트', '쪽지'];
+document.querySelectorAll('a[href^="/ClassMain/"], a[href^="/ClassReports/"]').forEach(function (a) {
+  var href = a.getAttribute('href') || '';
+  var m = href.match(/^\/Class(?:Main|Reports)\/(?:users\/)?(\d+)$/);
+  if (!m) return;
+  var name = (a.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!name || skip.indexOf(name.toLowerCase()) !== -1) return;
+  var key = m[1] + '|' + name;
+  if (seen[key]) return;
+  seen[key] = 1;
+  out.push({idx: m[1], name: name});
+});
+return out;
+"""
+
+_SET_LIST_JS = r"""
+// 클래스 화면의 세트 목록. 지금 진도인 세트와 종류(단어/문장)도 같이.
+//
+// 회색으로 흐리게 보이는 줄(class에 disabled)은 '잠긴 세트'가 아니다.
+// 선생님이 지금 진도로 지정한 세트만 진하게 보이고 나머지는 흐리게 보일 뿐,
+// 흐린 세트도 들어가면 카드가 다 있고 암기/리콜/스펠이 그대로 된다
+// (2026-09-23 직접 확인). 그래서 막지 않고 current 표시만 한다.
+var out = [];
+document.querySelectorAll('.set-items[data-idx]').forEach(function (row) {
+  var a = row.querySelector('.set-name-a');
+  if (!a) return;
+  var cnt = a.querySelector('span');
+  var name = (a.textContent || '').replace(/\s+/g, ' ').trim();
+  var count = cnt ? (cnt.textContent || '').trim() : '';
+  if (count) name = name.replace(count, '').trim();
+  var icon = row.querySelector('.set-icon');
+  out.push({
+    idx: row.getAttribute('data-idx'),
+    name: name,
+    count: count,
+    current: row.className.indexOf('disabled') === -1,
+    learning: row.className.indexOf('learn_set') !== -1,
+    sentence: !!(icon && icon.className.indexOf('sentence') !== -1)
+  });
+});
+return out;
+"""
+
+_SET_DETAIL_JS = r"""
+// 세트 페이지: 카드(영어/뜻)와 진도(%), 구간 수를 읽는다.
+function rate(sel) {
+  var el = document.querySelector(sel);
+  if (!el) return null;
+  var m = (el.textContent || '').match(/(\d+)\s*%/);
+  return m ? parseInt(m[1], 10) : null;
+}
+var cards = [];
+document.querySelectorAll('.flip-card').forEach(function (c) {
+  var eng = c.querySelector('.ex_front');
+  var kor = c.querySelector('.ex_back');
+  if (!eng || !kor) return;
+  var e = (eng.innerText || '').trim();
+  var k = (kor.innerText || '').trim();
+  if (e && k) cards.push({eng: e, kor: k});
+});
+// 구간별 학습 버튼(10개 단위). 주소의 숫자가 구간 번호다.
+// 그 구간을 그 모드로 다 끝냈으면 버튼에 progress-100이 붙는다.
+var segs = [], segDone = {};
+document.querySelectorAll('a[onclick*="/Memorize/"], a[onclick*="/Recall/"], a[onclick*="/Spell/"]').forEach(function (a) {
+  var m = (a.getAttribute('onclick') || '').match(/\/(Memorize|Recall|Spell)\/(\d+)\/(\d+)\/(\d+)/);
+  if (!m) return;
+  var seg = parseInt(m[3], 10);
+  if (seg >= 1000) return;  // 6000=전체, 4000=중요 카드만
+  var mode = m[1].toLowerCase();
+  if (segs.indexOf(seg) === -1) segs.push(seg);
+  if (!segDone[seg]) segDone[seg] = {};
+  segDone[seg][mode] = a.className.indexOf('progress-100') !== -1;
+});
+segs.sort(function (a, b) { return a - b; });
+return {
+  cards: cards,
+  segments: segs,
+  seg_done: segDone,
+  memorize: rate('.mem-total-rate'),
+  recall: rate('.recall-total-rate'),
+  spell: rate('.spell-total-rate'),
+  title: (document.title || '').replace('클래스카드 | ', '').trim()
+};
+"""
+
+
+_RATES_BATCH_JS = r"""
+// 세트 여러 개의 진도(%)를 한 번에 읽는다.
+//
+// 세트마다 페이지를 열어 이동하면 한 개에 1.5초쯤 걸려서, 세트가 80개인
+// 클래스는 몇 분이 걸렸다. 대신 지금 열린 페이지에서 세트 페이지의 내용만
+// 받아와(fetch) 화면에 안 붙이고 읽는다. 화면이 안 바뀌니 공부하던 탭을
+// 건드리지도 않고, 다섯 개에 0.5초면 끝난다.
+var cb = arguments[arguments.length - 1];
+var ids = arguments[0], cls = arguments[1];
+function one(id) {
+  return fetch('/set/' + id + '/' + cls, {credentials: 'include'})
+    .then(function (r) { return r.text(); })
+    .then(function (t) {
+      var doc = new DOMParser().parseFromString(t, 'text/html');
+      function rate(sel) {
+        var el = doc.querySelector(sel);
+        if (!el) return null;
+        var m = (el.textContent || '').match(/(\d+)\s*%/);
+        return m ? parseInt(m[1], 10) : null;
+      }
+      var segs = [], segDone = {};
+      doc.querySelectorAll('a[onclick*="/Memorize/"], a[onclick*="/Recall/"], a[onclick*="/Spell/"]').forEach(function (a) {
+        var m = (a.getAttribute('onclick') || '').match(/\/(Memorize|Recall|Spell)\/(\d+)\/(\d+)\/(\d+)/);
+        if (!m) return;
+        var seg = parseInt(m[3], 10);
+        if (seg >= 1000) return;
+        var mode = m[1].toLowerCase();
+        if (segs.indexOf(seg) === -1) segs.push(seg);
+        if (!segDone[seg]) segDone[seg] = {};
+        segDone[seg][mode] = a.className.indexOf('progress-100') !== -1;
+      });
+      segs.sort(function (a, b) { return a - b; });
+      // 카드가 하나도 없으면 세트 페이지를 제대로 못 받은 것이다.
+      var got = doc.querySelectorAll('.flip-card').length > 0;
+      return {idx: String(id), ok: got, segments: segs, seg_done: segDone,
+              memorize: rate('.mem-total-rate'),
+              recall: rate('.recall-total-rate'),
+              spell: rate('.spell-total-rate')};
+    })
+    .catch(function (e) { return {idx: String(id), ok: false}; });
+}
+Promise.all(ids.map(one)).then(cb);
+"""
+
+
+_CLASS_REPORT_JS = r"""
+// 클래스의 '리포트' 화면 한 장에 세트별 진도와 테스트 결과가 다 들어 있다
+// (/ClassReports/users/{클래스}). 세트마다 따로 열 필요 없이 한 번에 읽는다.
+var cb = arguments[arguments.length - 1];
+fetch('/ClassReports/users/' + arguments[0], {credentials: 'include'})
+  .then(function (r) { return r.text(); })
+  .then(function (t) {
+    var doc = new DOMParser().parseFromString(t, 'text/html');
+    var out = {};
+    doc.querySelectorAll('div.class-report-panel').forEach(function (p) {
+      // 세트 번호가 판 이름에 들어 있다: class="... penel-row10863783 ..."
+      var m = (p.className || '').match(/penel-row(\d+)/);
+      if (!m) return;
+      var rec = {memorize: null, recall: null, spell: null, test: ''};
+      p.querySelectorAll('.report-set > div').forEach(function (cell) {
+        var s = (cell.textContent || '').replace(/\s+/g, ' ').trim();
+        var pct = s.match(/(\d+)\s*%/);
+        var n = pct ? parseInt(pct[1], 10) : null;
+        if (s.indexOf('암기학습') === 0) rec.memorize = n;
+        else if (s.indexOf('리콜학습') === 0) rec.recall = n;
+        else if (s.indexOf('스펠학습') === 0) rec.spell = n;
+      });
+      // 테스트를 봤으면 결과 링크가 있다. 날짜와 점수가 <br>로 붙어 있어서
+      // 그냥 읽으면 '6/8 16:10100점'처럼 엉킨다. 날짜를 떼서 '날짜 | 점수'로.
+      var a = p.querySelector('a[href*="getTestReport"]');
+      if (a) {
+        var span = a.querySelector('span');
+        var when = span ? (span.textContent || '').trim() : '';
+        var rest = (a.textContent || '').replace(when, ' ')
+                     .replace(/\s+/g, ' ').trim();
+        rec.test = (when + ' | ' + rest).trim();
+      }
+      out[m[1]] = rec;
+    });
+    cb(out);
+  })
+  .catch(function (e) { cb(null); });
+"""
+
+
+def fetch_class_report(driver, class_idx):
+  """클래스 리포트 한 장에서 세트별 진도 + 테스트 결과를 읽는다."""
+  try:
+    return driver.execute_async_script(_CLASS_REPORT_JS, str(class_idx)) or {}
+  except Exception as e:
+    print('[DEBUG] 리포트 읽기 실패:', str(e).splitlines()[0][:60])
+    return {}
+
+
+def fetch_set_rates(driver, class_idx, set_ids):
+  """세트 여러 개의 진도를 한 번에 읽는다. {세트번호: {...}}"""
+  try:
+    out = driver.execute_async_script(
+        _RATES_BATCH_JS, [str(i) for i in set_ids], str(class_idx))
+  except Exception as e:
+    print('[DEBUG] 진도 한꺼번에 읽기 실패:', str(e).splitlines()[0][:60])
+    return {}
+  return {x['idx']: x for x in (out or []) if x.get('ok')}
+
+
+# 목록을 읽을 때 쓰는 탭. 공부 중인 탭을 빼앗지 않으려고 따로 둔다.
+_data_tab = None
+
+
+_STUDY_URL_PARTS = ('/memorize/', '/recall/', '/spell/', '/classtest/')
+
+
+def _is_study_tab(url):
+  url = (url or '').lower()
+  return any(part in url for part in _STUDY_URL_PARTS)
+
+
+def _enter_data_tab(driver):
+  """목록을 읽을 탭으로 옮긴다. 원래 보던 탭 손잡이를 돌려준다.
+
+  공부 중인 탭을 빼앗으면 안 되지만, 그렇다고 켤 때마다 새 탭을 만들면
+  탭이 계속 쌓인다(사용자 불편). 그래서
+    1) 지금 보고 있는 탭이 학습 화면이 아니면 그 탭을 그대로 쓰고,
+    2) 학습 중이면 이미 있는 다른 탭 중 학습 화면이 아닌 것을 쓰고,
+    3) 그런 탭도 없을 때만 새로 만든다."""
+  global _data_tab
+  try:
+    prev = driver.current_window_handle
+    handles = driver.window_handles
+  except Exception:
+    return None
+
+  try:
+    if not _is_study_tab(driver.current_url):
+      _data_tab = prev
+      return prev
+  except Exception:
+    pass
+
+  if _data_tab in handles and _data_tab != prev:
+    try:
+      driver.switch_to.window(_data_tab)
+      return prev
+    except Exception:
+      pass
+
+  for handle in handles:
+    if handle == prev:
+      continue
+    try:
+      driver.switch_to.window(handle)
+      if not _is_study_tab(driver.current_url):
+        _data_tab = handle
+        return prev
+    except Exception:
+      continue
+
+  # 학습 중이 아니면 굳이 새 탭을 만들 필요가 없다. 지금 탭이 학습 주소여도
+  # 아무도 안 쓰고 있으니 그대로 쓴다. (예전에는 [목록 새로고침]을 누를 때마다
+  # 새 탭이 하나씩 생겼다.)
+  try:
+    driver.switch_to.window(prev)
+  except Exception:
+    return None
+  if not (is_running or auto_running):
+    _data_tab = prev
+    return prev
+  try:
+    driver.switch_to.new_window('tab')
+    _data_tab = driver.current_window_handle
+  except Exception:
+    return None
+  return prev
+
+
+def _leave_data_tab(driver, prev):
+  try:
+    if prev and prev in driver.window_handles:
+      driver.switch_to.window(prev)
+  except Exception:
+    pass
+
+
+def _wait_page_ready(driver, timeout=8.0):
+  """페이지가 다 그려질 때까지 기다린다."""
+  end = time.time() + timeout
+  while time.time() < end:
+    try:
+      if driver.execute_script('return document.readyState;') == 'complete':
+        return True
+    except Exception:
+      return False
+    time.sleep(0.1)
+  return False
+
+
+def _open_site(driver, path):
+  """크롬을 그 주소로 옮기고 화면이 그려질 때까지 기다린다."""
+  url = path if path.startswith('http') else _SITE + path
+  try:
+    if (driver.current_url or '').rstrip('/') != url.rstrip('/'):
+      driver.get(url)
+    _wait_page_ready(driver)
+    return True
+  except Exception as e:
+    print('[DEBUG] 주소 이동 실패:', str(e).splitlines()[0][:80])
+    return False
+
+
+def _read_until(driver, script, tries=6, gap=0.4):
+  """목록이 채워질 때까지 몇 번 다시 읽는다.
+
+  페이지를 연 직후에는 목록이 아직 안 그려져서 빈 목록이 나오는 일이
+  있었다(클래스는 읽었는데 세트가 0개로 뜸)."""
+  for i in range(tries):
+    try:
+      out = driver.execute_script(script) or []
+    except Exception:
+      out = []
+    if out:
+      return out
+    if i < tries - 1:
+      time.sleep(gap)
+  return []
+
+
+def fetch_classes(driver):
+  """내 클래스 목록 [{'idx','name'}, ...]. 로그인 안 돼 있으면 빈 목록."""
+  prev = _enter_data_tab(driver)
+  try:
+    if not _open_site(driver, '/Main/user'):
+      return []
+    # 로그인이 안 돼 있으면 목록은 영영 안 나온다. 그런데도 6번 다시 읽느라
+    # 2초 넘게 서 있었다. 로그인부터 확인하고 바로 빈 목록을 돌려준다
+    # (부르는 쪽이 곧장 자동 로그인으로 넘어간다).
+    if not logged_in(driver):
+      return []
+    return _read_until(driver, _CLASS_LIST_JS)
+  except Exception:
+    return []
+  finally:
+    _leave_data_tab(driver, prev)
+
+
+def fetch_sets(driver, class_idx):
+  """클래스 안의 세트 목록."""
+  prev = _enter_data_tab(driver)
+  try:
+    if not _open_site(driver, f'/ClassMain/{class_idx}'):
+      return []
+    return _read_until(driver, _SET_LIST_JS)
+  except Exception:
+    return []
+  finally:
+    _leave_data_tab(driver, prev)
+
+
+def fetch_set_detail(driver, set_idx, class_idx):
+  """세트의 카드(단어/문장), 구간 수, 모드별 진도(%)."""
+  prev = _enter_data_tab(driver)
+  try:
+    if not _open_site(driver, f'/set/{set_idx}/{class_idx}'):
+      return None
+    data = {}
+    for i in range(6):
+      try:
+        data = driver.execute_script(_SET_DETAIL_JS) or {}
+      except Exception:
+        data = {}
+      if data.get('cards'):
+        break
+      if i < 5:
+        time.sleep(0.4)
+  except Exception:
+    return None
+  finally:
+    _leave_data_tab(driver, prev)
+  cards = data.get('cards') or []
+  # 문장 세트는 같은 카드가 두 번씩 들어오는 일이 있어 중복을 뺀다.
+  seen, uniq = set(), []
+  for c in cards:
+    key = (c.get('eng', ''), c.get('kor', ''))
+    if key in seen:
+      continue
+    seen.add(key)
+    uniq.append({'eng': c.get('eng', ''), 'kor': c.get('kor', '')})
+  data['cards'] = uniq
+  return data
+
+
+# --- 자동 로그인 ---
+#
+# 비밀번호는 Windows가 주는 잠금(DPAPI)으로 암호화해서 이 컴퓨터에만 저장한다.
+# 파일을 그대로 다른 컴퓨터로 옮겨도 풀리지 않고, 이 컴퓨터의 다른 사용자
+# 계정에서도 못 푼다. 그래도 비밀번호를 저장하는 일이므로, 저장 여부는
+# 사용자가 직접 고르게 한다(안 쓰면 예전처럼 직접 로그인).
+_LOGIN_FILE = os.path.join(
+    os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+    'ClasscardMacro', 'login.dat')
+
+
+class _DataBlob(ctypes.Structure):
+  _fields_ = [('cbData', ctypes.c_ulong),
+              ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(func, data):
+  """Windows 잠금(DPAPI)으로 암호화/복호화."""
+  buf = ctypes.create_string_buffer(data, len(data))
+  blob_in = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+  blob_out = _DataBlob()
+  ok = func(ctypes.byref(blob_in), None, None, None, None, 0,
+            ctypes.byref(blob_out))
+  if not ok:
+    raise OSError('Windows 암호화에 실패했습니다.')
+  try:
+    return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+  finally:
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def save_login(user_id, user_pw):
+  """아이디/비밀번호를 암호화해서 저장한다."""
+  raw = json.dumps({'id': user_id, 'pw': user_pw}).encode('utf-8')
+  enc = _dpapi(ctypes.windll.crypt32.CryptProtectData, raw)
+  os.makedirs(os.path.dirname(_LOGIN_FILE), exist_ok=True)
+  with open(_LOGIN_FILE, 'wb') as f:
+    f.write(enc)
+
+
+def load_login():
+  """저장해둔 아이디/비밀번호. 없으면 None."""
+  try:
+    with open(_LOGIN_FILE, 'rb') as f:
+      enc = f.read()
+    raw = _dpapi(ctypes.windll.crypt32.CryptUnprotectData, enc)
+    data = json.loads(raw.decode('utf-8'))
+    if data.get('id') and data.get('pw'):
+      return data
+  except Exception:
+    return None
+  return None
+
+
+def clear_login():
+  try:
+    os.remove(_LOGIN_FILE)
+    return True
+  except Exception:
+    return False
+
+
+def _dismiss_alert(driver):
+  """사이트가 띄운 경고창을 닫는다. 닫았으면 True.
+
+  경고창이 떠 있으면 매크로가 크롬을 조작할 수 없으므로 꼭 닫아야 한다."""
+  try:
+    alert = driver.switch_to.alert
+  except Exception:
+    return False
+  try:
+    text = (alert.text or '').strip()
+    alert.accept()
+    print(f'[AUTO] 사이트 경고창 닫음: {text[:60]}')
+  except Exception:
+    return False
+  return True
+
+
+_LOGIN_FILL_JS = r"""
+// 아이디/비밀번호 칸을 찾아서 한 번에 채운다. 채운 글자 수를 돌려준다.
+function visible(el) {
+  if (!el) return null;
+  var r = el.getBoundingClientRect();
+  return (r.width > 0 && r.height > 0) ? el : null;
+}
+var id = visible(document.querySelector('input[name="login_id"]'))
+      || visible(document.querySelector('#login_id'))
+      || visible(document.querySelector('input[name="user_id"]'));
+var pw = visible(document.querySelector('input[type="password"]'))
+      || visible(document.querySelector('input[name="login_pwd"]'))
+      || visible(document.querySelector('#login_pwd'));
+if (!id || !pw) return 0;
+function fill(el, value) {
+  el.focus();
+  el.value = value;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true}));
+}
+fill(id, arguments[0]);
+fill(pw, arguments[1]);
+return (pw.value || '').length;
+"""
+
+
+def logged_in(driver):
+  """지금 크롬이 로그인된 상태인지."""
+  try:
+    return bool(driver.execute_script(
+        "return !!(window.c_u && window.c_u > 0);"))
+  except Exception:
+    return False
+
+
+def auto_login(driver):
+  """저장해둔 계정으로 로그인한다. 성공하면 True."""
+  cred = load_login()
+  if not cred:
+    return False
+  print('[AUTO] 저장된 계정으로 로그인 시도')
+  _dismiss_alert(driver)
+  if not _open_site(driver, '/Login'):
+    return False
+  _dismiss_alert(driver)
+  if logged_in(driver):
+    return True
+
+  # 로그인 화면을 열자마자 사이트가 경고창을 띄우는 일이 있다(로그: 'error').
+  # 그 창을 닫으면 화면이 다시 그려져서, 미리 잡아둔 칸 손잡이가 끊어진다
+  # (stale element). 그래서 칸을 찾는 일과 글자를 넣는 일을 자바스크립트로
+  # 한 번에 처리하고, 버튼만 셀레니움으로 누른다.
+  #
+  # 기다리는 시간은 전부 '될 때까지 짧게 여러 번' 방식이다. 예전에는 칸이
+  # 그려지길 0.6초 통째로 자고, 로그인됐는지도 0.5초마다만 봐서 느렸다.
+  for attempt in range(3):
+    if attempt:
+      _open_site(driver, '/Login')
+    _dismiss_alert(driver)
+
+    # 아이디/비밀번호 칸이 그려지는 즉시 채운다(최대 3초).
+    typed = 0
+    end = time.time() + 3.0
+    while time.time() < end:
+      try:
+        typed = driver.execute_script(_LOGIN_FILL_JS, cred['id'], cred['pw'])
+      except Exception:
+        typed = 0
+        if _dismiss_alert(driver):
+          continue
+      if typed:
+        break
+      time.sleep(0.1)
+    if not typed:
+      print('[AUTO] 로그인 칸을 못 찾음')
+      continue
+
+    if not click_button_by_text(driver, ['로그인'], wait_after=0):
+      try:
+        driver.execute_script(
+            "var f = document.querySelector('input[name=\"login_pwd\"]');"
+            "if (f && f.form) f.form.submit();")
+      except Exception:
+        pass
+
+    # 로그인되는 즉시 넘어간다(최대 8초).
+    end = time.time() + 8.0
+    while time.time() < end:
+      if logged_in(driver):
+        print('[AUTO] 로그인 완료')
+        return True
+      if _dismiss_alert(driver):
+        break
+      time.sleep(0.12)
+  print('[AUTO] 로그인 실패 (아이디/비밀번호 확인)')
+  return False
+
+
+def open_login_settings():
+  """자동 로그인에 쓸 계정을 넣는 작은 창."""
+  win = tk.Toplevel(root)
+  win.title('자동 로그인')
+  win.resizable(False, False)
+  win.wm_attributes('-topmost', True)
+
+  tk.Label(win, text='클래스카드 계정', font=('맑은 고딕', 12, 'bold')).pack(
+      padx=24, pady=(18, 4))
+  tk.Label(win,
+           text='저장해두면 로그인이 풀렸을 때 프로그램이 알아서 로그인합니다.\n'
+                '비밀번호는 이 컴퓨터(Windows 계정)에서만 풀 수 있게 암호화해\n'
+                '저장합니다. 저장하지 않으면 예전처럼 크롬에서 직접 로그인하면 됩니다.',
+           font=('맑은 고딕', 9), fg='gray', justify='center').pack(padx=24)
+
+  frame = tk.Frame(win)
+  frame.pack(padx=24, pady=12)
+  tk.Label(frame, text='아이디', font=('맑은 고딕', 10)).grid(row=0, column=0,
+                                                          sticky='e', pady=4)
+  ent_id = tk.Entry(frame, width=24, font=('맑은 고딕', 10))
+  ent_id.grid(row=0, column=1, padx=8, pady=4)
+  tk.Label(frame, text='비밀번호', font=('맑은 고딕', 10)).grid(row=1, column=0,
+                                                           sticky='e', pady=4)
+  ent_pw = tk.Entry(frame, width=24, show='*', font=('맑은 고딕', 10))
+  ent_pw.grid(row=1, column=1, padx=8, pady=4)
+
+  saved = load_login()
+  if saved:
+    ent_id.insert(0, saved['id'])
+    ent_pw.insert(0, saved['pw'])
+
+  lbl = tk.Label(win, text='저장된 계정이 있습니다.' if saved else '저장된 계정이 없습니다.',
+                 font=('맑은 고딕', 9), fg='gray')
+  lbl.pack()
+
+  def do_save():
+    user_id = ent_id.get().strip()
+    user_pw = ent_pw.get()
+    if not user_id or not user_pw:
+      messagebox.showwarning('자동 로그인', '아이디와 비밀번호를 모두 적어주세요.')
+      return
+    try:
+      save_login(user_id, user_pw)
+    except Exception as e:
+      messagebox.showerror('자동 로그인', f'저장하지 못했습니다:\n{e}')
+      return
+    lbl.config(text='저장했습니다.', fg='#2E7D32')
+
+  def do_clear():
+    clear_login()
+    ent_id.delete(0, tk.END)
+    ent_pw.delete(0, tk.END)
+    lbl.config(text='저장된 계정을 지웠습니다.', fg='#D32F2F')
+
+  btns = tk.Frame(win)
+  btns.pack(pady=(8, 18))
+  tk.Button(btns, text='저장', width=10, font=('맑은 고딕', 10, 'bold'),
+            fg='#2E7D32', command=do_save).pack(side='left', padx=6)
+  tk.Button(btns, text='지우기', width=10, font=('맑은 고딕', 10),
+            fg='#C62828', command=do_clear).pack(side='left', padx=6)
+  tk.Button(btns, text='닫기', width=10, font=('맑은 고딕', 10),
+            command=win.destroy).pack(side='left', padx=6)
+
+
+def _set_loaded_words(cards, source, set_idx=None):
+  """불러온 카드로 word_list를 채우고 버튼을 켠다."""
+  global word_list, loaded_set_idx
+  loaded_set_idx = str(set_idx) if set_idx else None
+  seen = set()
+  word_list = []
+  for item in cards:
+    key = (item.get('eng', ''), item.get('kor', ''))
+    if not key[0] or not key[1] or key in seen:
+      continue
+    seen.add(key)
+    word_list.append({'eng': item['eng'], 'kor': item['kor']})
+  lbl_status.config(
+      text=f'준비 완료! {source}에서 {len(word_list)}개 불러옴\n'
+           '모드에 맞는 버튼을 누르세요.',
+      fg='#388E3C',
+  )
+  btn_start.config(state=tk.NORMAL)
+  btn_recall_start.config(state=tk.NORMAL)
+  btn_spell_start.config(state=tk.NORMAL)
+  btn_test_start.config(state=tk.NORMAL)
+  on_kind_change()  # 문장 모드에서 막아둔 버튼은 계속 막아둔다
+
+
+def _idx_from_url(url):
+  """지금 열려 있는 주소에서 (세트 번호, 클래스 번호)를 뽑는다."""
+  url = (url or '').split('?')[0]
+  m = re.search(r'/(?:Memorize|Recall|Spell)/(\d+)/\d+/(\d+)', url, re.I)
+  if m:
+    return m.group(1), m.group(2)
+  m = re.search(r'/set/(\d+)/(\d+)', url, re.I)
+  if m:
+    return m.group(1), m.group(2)
+  # 테스트 주소만 세트와 클래스 순서가 반대다(/ClassTest/클래스/세트).
+  m = re.search(r'/ClassTest/(\d+)/(\d+)', url, re.I)
+  if m:
+    return m.group(2), m.group(1)
+  return None, None
+
+
+_SET_CARDS_FETCH_JS = r"""
+// 세트 페이지의 카드만 몰래 읽어온다. 탭을 옮기지도, 주소를 바꾸지도
+// 않는다(같은 classcard.net 안에 있을 때만 쓸 수 있다).
+var cb = arguments[arguments.length - 1];
+fetch('/set/' + arguments[0] + '/' + arguments[1], {credentials: 'include'})
+  .then(function (r) { return r.text(); })
+  .then(function (t) {
+    var doc = new DOMParser().parseFromString(t, 'text/html');
+    var out = [];
+    doc.querySelectorAll('.flip-card').forEach(function (c) {
+      var e = c.querySelector('.ex_front'), k = c.querySelector('.ex_back');
+      if (!e || !k) return;
+      var a = (e.textContent || '').trim(), b = (k.textContent || '').trim();
+      if (a && b) out.push({eng: a, kor: b});
+    });
+    cb(out);
+  })
+  .catch(function () { cb(null); });
+"""
+
+
+def fetch_set_cards(driver, set_idx, class_idx):
+  """세트의 카드를 '공부하던 화면 그대로' 읽는다(이동/새 탭 없음)."""
+  try:
+    cards = driver.execute_async_script(
+        _SET_CARDS_FETCH_JS, str(set_idx), str(class_idx))
+  except Exception as e:
+    print('[DEBUG] 세트 카드 읽기 실패:', str(e).splitlines()[0][:60])
+    return []
+  seen, uniq = set(), []
+  for c in cards or []:
+    key = ((c.get('eng') or '').strip(), (c.get('kor') or '').strip())
+    if not key[0] or not key[1] or key in seen:
+      continue
+    seen.add(key)
+    uniq.append({'eng': key[0], 'kor': key[1]})
+  return uniq
+
+
+# 지금 word_list에 담긴 게 어느 세트 것인지. 화면과 어긋났는지 볼 때 쓴다.
+loaded_set_idx = None
+_last_list_sync = 0.0
+
+
+def study_card_total(driver):
+  """이 학습 화면이 '몇 장짜리'인지. 화면 위쪽의 '6/12' 표시에서 뒤 숫자를
+  읽는다. 못 읽으면 -1."""
+  try:
+    out = driver.execute_script(_PROGRESS_JS)
+  except Exception:
+    return -1
+  if out and len(out) == 2:
+    return int(out[1])
+  return -1
+
+
+def warn_if_no_cards(driver):
+  """할 카드가 0장이면 화면에 알려주고 True. 아니면 False.
+
+  이미 100%까지 끝낸 구간에 다시 들어가면 사이트가 '0/0'을 주면서 아무
+  문제도 안 낸다. 예전에는 매크로가 그걸 모르고 [영작 연습하기]만 끝없이
+  누르고 있어서, 사용자 눈에는 '들어왔는데 인식을 못 한다'로 보였다."""
+  if study_card_total(driver) != 0:
+    return False
+  print('[DEBUG] 이 학습 화면에 할 카드가 0장이다(0/0)')
+  root.after(0, lambda: lbl_status.config(
+      text='이 학습에 남은 카드가 없습니다(0/0).\n'
+           '이미 100%까지 끝낸 구간이면 세트 화면에서 다음 구간이나 '
+           '다른 세트를 골라주세요.', fg='#D32F2F'))
+  return True
+
+
+def ensure_word_list_for_screen(driver, min_gap=3.0):
+  """화면에 열린 세트와 불러온 단어가 다르면, 화면 쪽 세트로 다시 읽어온다.
+
+  수동 모드에서 제일 흔한 사고다. A 세트를 불러온 채로 B 세트의 학습
+  화면에 들어가면, 화면은 멀쩡한데 아는 문장/단어가 하나도 없어서 매크로가
+  '학습 화면을 기다리는 중'에서 가만히 있는다 - 사용자 눈에는 '들어왔는데
+  인식을 못 한다'로 보인다. 이제는 알아서 화면 쪽 세트로 맞춘다.
+
+  자동 학습은 스스로 세트를 맞춰 넣으므로 건드리지 않는다."""
+  global word_list, loaded_set_idx, _last_list_sync
+  if auto_running:
+    return False
+  now = time.time()
+  if now - _last_list_sync < min_gap:
+    return False
+  _last_list_sync = now
+  try:
+    url = driver.current_url or ''
+  except Exception:
+    return False
+  set_idx, class_idx = _idx_from_url(url)
+  if not set_idx or not class_idx:
+    return False
+  if word_list and str(loaded_set_idx) == str(set_idx):
+    return False
+  cards = fetch_set_cards(driver, set_idx, class_idx)
+  if not cards:
+    return False
+  word_list = cards
+  loaded_set_idx = str(set_idx)
+  print(f'[DEBUG] 화면에 열린 세트({set_idx})로 {len(cards)}개 다시 읽음')
+  root.after(0, lambda n=len(cards): lbl_status.config(
+      text=f'화면에 열린 세트에서 {n}개를 불러왔습니다. 이어서 풉니다...',
+      fg='#0288D1'))
+  return True
+
+
+def load_words():
+  """크롬에 열려 있는 세트에서 단어/문장을 바로 읽어온다.
+
+  예전에는 북마크릿으로 단어를 복사해 클립보드로 넘겨야 했다. 로그인된
+  크롬이 있으면 세트 페이지에서 그대로 읽을 수 있어서 그 과정이 필요 없다.
+  주소로 세트를 못 알아내면 예전처럼 클립보드에서 읽는다."""
+
+  def work():
+    try:
+      driver = get_driver()
+    except Exception as e:
+      err = str(e)
+      root.after(0, lambda: messagebox.showerror(
+          '불러오기', f'크롬을 열지 못했습니다:\n{err}'))
+      return
+    try:
+      url = driver.current_url
+    except Exception:
+      url = ''
+    set_idx, class_idx = _idx_from_url(url)
+    if not set_idx:
+      root.after(0, lambda: lbl_status.config(
+          text='크롬에서 공부할 단어장을 먼저 열어주세요. (클립보드로 시도합니다)',
+          fg='#D32F2F'))
+      root.after(0, load_from_clipboard)
+      return
+    root.after(0, lambda: lbl_status.config(
+        text='세트에서 단어를 읽는 중...', fg='#0288D1'))
+    detail = fetch_set_detail(driver, set_idx, class_idx)
+    if not detail or not detail.get('cards'):
+      root.after(0, lambda: lbl_status.config(
+          text='세트에서 단어를 못 읽었습니다. 클립보드로 시도합니다.', fg='#D32F2F'))
+      root.after(0, load_from_clipboard)
+      return
+    cards = detail['cards']
+    # 단어장 종류도 자동으로 맞춘다(문장 세트면 문장 모드로).
+    kind = None
+    sets = fetch_sets(driver, class_idx) if class_idx else []
+    for item in sets:
+      if str(item.get('idx')) == str(set_idx):
+        kind = 'sentence' if item.get('sentence') else 'word'
+        break
+    if kind is None:
+      long_cards = sum(1 for c in cards if ' ' in (c.get('eng') or '').strip())
+      kind = 'sentence' if long_cards > len(cards) / 2 else 'word'
+
+    def done():
+      if SENTENCE_MODE_ENABLED:
+        study_kind.set(kind)
+      _set_loaded_words(cards, detail.get('title') or '세트', set_idx)
+
+    root.after(0, done)
+
+  threading.Thread(target=work, daemon=True).start()
+
+
 def load_from_clipboard():
   global word_list
   word_list.clear()
@@ -110,18 +965,7 @@ def load_from_clipboard():
           continue
         seen.add(key)
         word_list.append(item)
-      lbl_status.config(
-          text=(
-              f'준비 완료! 총 {len(word_list)}개 단어 로드됨\n모드에 맞는 버튼을'
-              ' 누르세요.'
-          ),
-          fg='#388E3C',
-      )
-      btn_start.config(state=tk.NORMAL)
-      btn_recall_start.config(state=tk.NORMAL)
-      btn_spell_start.config(state=tk.NORMAL)
-      btn_test_start.config(state=tk.NORMAL)
-      on_kind_change()  # 문장 모드에서 막아둔 버튼은 계속 막아둔다
+      _set_loaded_words(word_list, '클립보드')
     else:
       messagebox.showerror('에러', '올바른 클래스카드 데이터가 아닙니다.')
   except Exception:
@@ -165,7 +1009,14 @@ def memo_worker():
 
     ready = False
     waiting_go = False
-    memo_go.clear()
+    # 자동 학습 중에는 사람이 [시작]을 누를 필요가 없다.
+    # (예전에는 여기서 무조건 memo_go를 지웠다. 그런데 자동 학습은 이 스레드를
+    #  띄우기 직전에 memo_go를 켜두기 때문에, 켜둔 신호가 곧바로 지워져서
+    #  암기가 '[시작] 버튼 대기'에서 영영 멈춰 있었다.)
+    if auto_running:
+      memo_go.set()
+    else:
+      memo_go.clear()
 
     while is_running:
       # 구간이 끝나 완료 화면이 떠 있으면 먼저 다음 구간으로 넘긴다.
@@ -245,6 +1096,7 @@ def memo_worker():
         break
 
       ActionChains(driver).send_keys(Keys.ARROW_RIGHT).perform()
+      _auto_card_done()  # 카드 한 장 넘겼다(자동 학습이 한 바퀴를 세는 데 쓴다)
       time.sleep(0.3)
 
   except Exception as e:
@@ -355,12 +1207,34 @@ def _norm_token(text):
   부호를 떼고 소문자로 맞춘다. 아포스트로피는 낱말 안에 들어가므로
   (I'm) 뗀 뒤 비교해도 되게 함께 제거한다."""
   t = _norm_quotes(text).lower()
-  return re.sub(r"[^0-9a-zÀ-ɏ]+", '', t)
+  cleaned = re.sub(r"[^0-9a-zÀ-ɏ]+", '', t)
+  # 'a pot & small stones'처럼 기호 하나가 낱말로 나오는 문장이 있다.
+  # 기호를 다 지우면 그 낱말이 사라져서, 화면의 '&' 조각을 건너뛰고 다음
+  # 낱말을 눌러 오답이 났다. 글자가 하나도 안 남으면 기호 그대로 쓴다.
+  return cleaned or t.strip()
 
 
 def _sentence_tokens(sentence):
   """영어 문장을 화면 조각과 같은 형태의 낱말 목록으로 쪼갠다."""
   return [t for t in (_norm_token(w) for w in _norm_quotes(sentence).split()) if t]
+
+
+def _sentence_chunks(sentence):
+  """맞춰볼 후보 목록: 문장 전체 + ' / '로 나뉜 토막들.
+
+  '끊어읽기' 세트는 카드 하나가
+  'Peter is visiting Korea / to meet a friend, Mina, / from a sister school.'
+  처럼 토막 나 있고, 사이트는 보통 토막을 하나씩 따로 물어본다. 짧은 카드는
+  토막을 한꺼번에 묻기도 해서 '전체'도 후보에 넣는다.
+
+  이때 끊는 표시 '/'는 낱말이 아니므로 빼야 한다. 안 빼면 문장 낱말 수가
+  하나 더 많아져서, 조각이 다 있는데도 '어느 구간과도 안 맞는다'며 멈췄다.
+  (`and/or`처럼 붙어 있는 빗금은 낱말의 일부이므로 양쪽이 띄어져 있을 때만
+   끊는 표시로 본다)"""
+  parts = re.split(r'\s+/\s+', sentence)
+  if len(parts) == 1:
+    return [sentence]
+  return [' '.join(parts)] + [part for part in parts if part.strip()]
 
 
 def _norm_meaning(text):
@@ -411,7 +1285,11 @@ def _pick_choice(choices, target):
 
 _VISIBLE_JS = """
 function isReallyVisible(el) {
-  if (typeof el.checkVisibility === 'function') {
+  // 크롬 창을 내리거나 다른 탭을 보고 있으면(document.hidden) 이 페이지는
+  // '안 보이는 문서'가 되어, checkVisibility가 화면에 멀쩡히 그려진 것까지
+  // 전부 false로 돌려준다. 그러면 매크로가 문제를 하나도 못 읽고 멈춘다
+  // (창을 내려놓으면 학습이 멈추던 원인). 그럴 때는 아래 직접 검사로 판단한다.
+  if (!document.hidden && typeof el.checkVisibility === 'function') {
     try {
       return el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
     } catch (e) {}
@@ -507,7 +1385,9 @@ for (var i = 0; i < nodes.length; i++) {
     } catch (e) {}
   }
   if (!hit) continue;
-  if (typeof el.checkVisibility === 'function') {
+  // 창을 내려놓으면(document.hidden) checkVisibility가 전부 false라 버튼을
+  // 하나도 못 찾는다. 그럴 때는 크기로만 판단한다.
+  if (!document.hidden && typeof el.checkVisibility === 'function') {
     try {
       if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
     } catch (e) {}
@@ -519,6 +1399,16 @@ return null;
 """
 
 _SECTION_DONE_LABELS = ['다음 구간으로 이동', '다음 구간 이동', '계속하기']
+# 위 세 개 중 [다음 구간으로 이동]만 '같은 바퀴를 이어서'다. [계속하기]는
+# 세트를 다 끝낸 뒤 '한 바퀴 더'라서, 자동 학습에서는 누르면 안 된다.
+# (스펠이 여기서 계속 눌려 같은 세트를 340%까지 돌고 있었다)
+_SECTION_NEXT_LABELS = ['다음 구간으로 이동', '다음 구간 이동']
+# 테스트를 다 풀면 '와우 100점이에요!' 화면에 [제출 결과 확인]만 남는다.
+# 이것도 '다 끝났다'는 신호다(이걸 모르고 30분이나 기다린 적이 있다).
+_SECTION_AGAIN_LABELS = ['계속하기', '제출 결과 확인']
+# 테스트를 다 본 화면의 버튼. 단어 테스트는 [제출 결과 확인], 문장 테스트는
+# 점수와 [완료]만 뜬다. '완료'는 흔한 낱말이라 테스트 화면에서만 본다.
+_TEST_DONE_LABELS = ['완료', '제출 결과 확인', '결과 확인']
 # 테스트에서 덜 배열한 채 제출하면 '아직 배열하지 않은 단어가 있습니다'
 # 확인창이 뜬다. 떠 있으면 아무것도 못 누르므로 [취소]로 닫는다.
 _CANCEL_LABELS = ['취소']
@@ -658,11 +1548,94 @@ def click_button_by_text(driver, labels, patterns=None, wait_after=1.2):
 
   if moved:
     # 다음 화면이 뜰 때까지 대기. 통째로 자면 [정지]가 안 먹으므로 쪼갠다.
+    # (is_running만 보다가, 자동 학습이 워커를 띄우기 전 단계에서는 한 번도
+    #  안 기다려서 버튼을 1초에 수십 번씩 누른 적이 있다)
     for _ in range(int(wait_after / 0.1)):
-      if not is_running:
+      if not (is_running or auto_running):
         break
       time.sleep(0.1)
   return moved
+
+
+def _spell_next_card(driver, timeout=3.0):
+  """스펠에서 답을 낸 뒤 [다음 카드]가 나오면 바로 눌러 넘어간다.
+
+  화면을 0.2초 간격으로 재보니 이렇게 흘러간다(2026-09-24 실측).
+    0.0초 ~ 1.4초  큰 버튼이 아직 [확인/건너뛰기] - 스페이스를 보내도 씹힌다
+    1.5초쯤        버튼이 **[다음 카드]**로 바뀐다 - 이때부터 넘어갈 수 있다
+    (사이트가 저절로 넘어가지는 않는다. 6.9초를 그냥 두고 봤는데 그대로였다.)
+
+  그래서 '언제쯤 되겠지' 하고 쉬는 대신, 버튼이 나타나는 순간을 지켜보다가
+  바로 누른다. 이보다 빨리는 사이트가 안 넘겨준다.
+
+  여기서는 버튼만 본다(가벼운 확인 한 번). 화면 글자를 매번 읽으면 그게
+  0.3초씩 걸려서, 정작 버튼이 떠도 늦게 알아챘다."""
+  end = time.time() + timeout
+  while time.time() < end:
+    if not (is_running or auto_running):
+      return False
+    btn = find_button_by_text(driver, _NEXT_CARD_LABELS)
+    if btn:
+      try:
+        btn.click()
+      except Exception:
+        press_space_now(driver)
+      time.sleep(0.15)   # 다음 카드가 그려질 짬
+      return True
+    time.sleep(0.05)
+  return False
+
+
+def _wait_next_sentence(driver, solved_key, timeout=1.5):
+  """문장을 하나 맞힌 뒤, 다음 화면이 나오는 순간 바로 움직인다.
+
+  둘 중 먼저 오는 쪽에 반응한다.
+   - '문장 확인' 화면의 [영작 연습하기] -> 스페이스로 바로 연다.
+   - 다음 문제의 조각 -> 아무것도 안 하고 바로 돌아가서 푼다.
+
+  예전에는 [영작 연습하기]만 최대 2초까지 기다렸다. 그 화면 없이 다음
+  문제가 바로 나오는 경우에는 그 2초를 문장마다 통째로 버렸고, 그래서
+  '시작하면 계속 몇 초 있다가 누른다'는 말이 나왔다. 방금 푼 문장의 조각은
+  화면에 잠깐 남아 있으므로, 조각이 '방금 푼 것과 다를 때'만 다음 문제로
+  본다."""
+  end = time.time() + timeout
+  while time.time() < end:
+    if not (is_running or auto_running):
+      return
+    try:
+      # 카드를 맞히면 'Good Job!'과 함께 [한번 더] [다음 카드]만 뜨는 화면이
+      # 있다(낱말이 하나뿐인 카드 등). 여기서는 스페이스가 안 먹어서,
+      # [다음 카드]를 안 누르면 영영 그 자리에 멈춰 있었다.
+      # ([한번 더]는 절대 누르면 안 된다 - 같은 카드를 다시 한다.)
+      btn = find_button_by_text(driver, _NEXT_CARD_LABELS)
+      if btn:
+        print('[DEBUG] Good Job 화면 - [다음 카드] 누름')
+        try:
+          btn.click()
+        except Exception:
+          press_space(driver)
+        time.sleep(0.15)
+        return
+      if find_button_by_text(driver, _WRITE_PRACTICE_LABELS):
+        press_space(driver)
+        # 화면이 실제로 넘어갈 때까지만 잠깐 본다. 이걸 안 보면 바깥
+        # 반복문이 곧바로 같은 버튼을 또 찾아서 스페이스를 두 번 보낸다.
+        gone = time.time() + 0.6
+        while time.time() < gone:
+          if not find_button_by_text(driver, _WRITE_PRACTICE_LABELS):
+            break
+          time.sleep(0.06)
+        return
+      groups = read_scramble_groups(driver)
+      if groups:
+        items = _usable_items(groups[0])
+        if items:
+          key = tuple(sorted(_norm_token(t) for _, t in items))
+          if key != solved_key:
+            return   # 다음 문제가 벌써 떠 있다
+    except Exception:
+      pass
+    time.sleep(0.05)
 
 
 def handle_section_done(driver):
@@ -670,6 +1643,18 @@ def handle_section_done(driver):
 
   [다음 구간으로 이동]을 누른 뒤 1.5초 두고 다음 문제로 넘어간다. 바로
   이어서 진행하면 너무 빨라서 따라가기 어려웠다."""
+  if auto_running:
+    # 세트를 다 끝낸 화면('200% 도전' 또는 [계속하기])이면 여기서 이 모드를
+    # 마치고 다음 모드로 넘어간다. 누르면 같은 세트를 한 바퀴 더 돌게 된다.
+    if find_button_by_text(driver, _SECTION_AGAIN_LABELS, _SECTION_DONE_PATTERNS):
+      auto_mode_done.set()
+      return False
+    # 테스트를 다 봤으면 여기서 끝낸다(문장 테스트는 [완료]만 뜬다).
+    if on_class_test(driver) and find_button_by_text(driver, _TEST_DONE_LABELS):
+      auto_mode_done.set()
+      return False
+    # 구간 하나가 끝난 것뿐이면 이어서 다음 구간으로 간다(같은 한 바퀴).
+    return click_button_by_text(driver, _SECTION_NEXT_LABELS, wait_after=1.5)
   return click_button_by_text(
       driver, _SECTION_DONE_LABELS, _SECTION_DONE_PATTERNS, wait_after=1.5
   )
@@ -749,6 +1734,8 @@ def selenium_worker():
 
   try:
     driver = get_driver()
+    # 시작하자마자, 화면에 열린 세트와 불러온 단어가 같은지 맞춰본다.
+    ensure_word_list_for_screen(driver, min_gap=0)
 
     root.after(
         0,
@@ -821,6 +1808,18 @@ def selenium_worker():
           except Exception as e:
             print('키 입력 에러:', e)
         print(f"[DEBUG] 매칭성공={pressed}")
+        if pressed:
+          _auto_card_done(current_word)
+
+        if not pressed and is_running:
+          # 구간 완료 화면인데도 지난 카드 단어가 화면에 남아 있어(스펠에서
+          # 실측: young, child) 새 문제로 착각하고 계속 답만 찾다가 멈추는
+          # 일이 있었다. 선택이 안 되면 완료/다음 카드 버튼을 본다.
+          if handle_section_done(driver) or click_button_by_text(
+              driver, _NEXT_CARD_LABELS, wait_after=0.4
+          ):
+            last_seen_eng = current_word['eng']
+            continue
 
         if pressed and is_running:
           last_seen_eng = current_word['eng']
@@ -843,6 +1842,12 @@ def selenium_worker():
         if click_button_by_text(
             driver, _NEXT_CARD_LABELS, wait_after=0.4
         ):
+          continue
+        # 화면에 열린 세트와 불러온 단어가 다르면 여기서 맞춘다.
+        if ensure_word_list_for_screen(driver):
+          continue
+        if warn_if_no_cards(driver):
+          time.sleep(1.0)
           continue
         root.after(
             0,
@@ -892,6 +1897,8 @@ def spelling_worker():
 
   try:
     driver = get_driver()
+    # 시작하자마자, 화면에 열린 세트와 불러온 단어가 같은지 맞춰본다.
+    ensure_word_list_for_screen(driver, min_gap=0)
 
     root.after(
         0,
@@ -960,16 +1967,29 @@ def spelling_worker():
             input_el.click()
             input_el.clear()
             input_el.send_keys(target_kor)
-            time.sleep(0.2)
             input_el.send_keys(Keys.RETURN)
-            time.sleep(1.7)  # 정답 확인 후 결과 화면이 뜰 시간
-            ActionChains(driver).send_keys(Keys.SPACE).perform()
+            # 채점 -> 다음 카드가 뜨는 순간 바로 이어서 푼다.
+            if not _spell_next_card(driver):
+              press_space_now(driver)
             typed = True
           except StaleElementReferenceException:
             pass
           except Exception as e:
             print('입력 에러:', e)
         print(f"[DEBUG] 입력성공={typed}")
+        if typed:
+          _auto_card_done(current_word)
+
+        if not typed and is_running:
+          # 구간 완료 화면('GOOD JOB!! 구간 학습이 완료되었습니다')인데도
+          # 지난 카드의 단어가 .spell-content에 그대로 남아 있어서(실측:
+          # young, child가 계속 보임) 새 문제로 착각하고 입력창만 찾다가
+          # 영영 멈춰 있었다. 입력이 안 되면 완료/다음 카드 버튼을 본다.
+          if handle_section_done(driver) or click_button_by_text(
+              driver, _NEXT_CARD_LABELS, wait_after=0.4
+          ):
+            last_seen_eng = current_word['eng']
+            continue
 
         if typed and is_running:
           last_seen_eng = current_word['eng']
@@ -980,7 +2000,6 @@ def spelling_worker():
                   fg='#388E3C',
               ),
           )
-          time.sleep(0.4)
       else:
         # 다른 탭에서 학습 화면을 열었으면 그 탭으로 옮긴다. 화면을 못 읽고
         # 있을 때만 확인하므로 평소 속도에는 영향이 없다.
@@ -993,6 +2012,12 @@ def spelling_worker():
             driver, _NEXT_CARD_LABELS, wait_after=0.4
         ):
           continue
+        # 화면에 열린 세트와 불러온 단어가 다르면 여기서 맞춘다.
+        if ensure_word_list_for_screen(driver):
+          continue
+        if warn_if_no_cards(driver):
+          time.sleep(1.0)
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
@@ -1000,7 +2025,8 @@ def spelling_worker():
             ),
         )
 
-      time.sleep(0.3)
+      # 방금 카드를 푼 직후에는 다음 문제를 이미 확인했으므로 안 쉰다.
+      time.sleep(0.02 if current_word else 0.3)
 
   except Exception as e:
     err_msg = str(e)
@@ -1056,7 +2082,25 @@ for (var i = 0; i < nodes.length; i++) {
   var el = nodes[i];
   if (typeof el.checkVisibility === 'function') {
     try {
-      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+      if (!(function (e) {
+      // 창을 내려놓거나 다른 탭을 보고 있으면(document.hidden) 크롬의
+      // checkVisibility가 멀쩡히 그려진 것도 전부 false로 답한다.
+      // 그럴 때는 크기와 조상 스타일로 직접 판단한다.
+      if (!document.hidden) {
+        try { return e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}); }
+        catch (err) {}
+      }
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      var n = e;
+      while (n && n.nodeType === 1) {
+        var cs = getComputedStyle(n);
+        if (cs.display === "none" || cs.visibility === "hidden" ||
+            parseFloat(cs.opacity) === 0) return false;
+        n = n.parentElement;
+      }
+      return true;
+    })(el)) continue;
     } catch (e) {}
   }
   var r = el.getBoundingClientRect();
@@ -1134,7 +2178,25 @@ for (var i = 0; i < nodes.length; i++) {
   if (el.closest && el.closest('.cc-table.middle.fill-parent')) continue;
   if (typeof el.checkVisibility === 'function') {
     try {
-      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+      if (!(function (e) {
+      // 창을 내려놓거나 다른 탭을 보고 있으면(document.hidden) 크롬의
+      // checkVisibility가 멀쩡히 그려진 것도 전부 false로 답한다.
+      // 그럴 때는 크기와 조상 스타일로 직접 판단한다.
+      if (!document.hidden) {
+        try { return e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}); }
+        catch (err) {}
+      }
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      var n = e;
+      while (n && n.nodeType === 1) {
+        var cs = getComputedStyle(n);
+        if (cs.display === "none" || cs.visibility === "hidden" ||
+            parseFloat(cs.opacity) === 0) return false;
+        n = n.parentElement;
+      }
+      return true;
+    })(el)) continue;
     } catch (e) {}
   }
   var r = el.getBoundingClientRect();
@@ -1204,7 +2266,25 @@ if (l && l.control && l.control.checked) return true;
 if ((el.textContent || '').trim() !== txt) return true;
 if (typeof el.checkVisibility === 'function') {
   try {
-    if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) return true;
+    if (!(function (e) {
+      // 창을 내려놓거나 다른 탭을 보고 있으면(document.hidden) 크롬의
+      // checkVisibility가 멀쩡히 그려진 것도 전부 false로 답한다.
+      // 그럴 때는 크기와 조상 스타일로 직접 판단한다.
+      if (!document.hidden) {
+        try { return e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}); }
+        catch (err) {}
+      }
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      var n = e;
+      while (n && n.nodeType === 1) {
+        var cs = getComputedStyle(n);
+        if (cs.display === "none" || cs.visibility === "hidden" ||
+            parseFloat(cs.opacity) === 0) return false;
+        n = n.parentElement;
+      }
+      return true;
+    })(el)) return true;
   } catch (e) {}
 }
 var r = el.getBoundingClientRect();
@@ -1305,7 +2385,25 @@ function onScreen(sel, hitTest) {
     var el = nodes[i];
     if (typeof el.checkVisibility === 'function') {
       try {
-        if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+        if (!(function (e) {
+      // 창을 내려놓거나 다른 탭을 보고 있으면(document.hidden) 크롬의
+      // checkVisibility가 멀쩡히 그려진 것도 전부 false로 답한다.
+      // 그럴 때는 크기와 조상 스타일로 직접 판단한다.
+      if (!document.hidden) {
+        try { return e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}); }
+        catch (err) {}
+      }
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      var n = e;
+      while (n && n.nodeType === 1) {
+        var cs = getComputedStyle(n);
+        if (cs.display === "none" || cs.visibility === "hidden" ||
+            parseFloat(cs.opacity) === 0) return false;
+        n = n.parentElement;
+      }
+      return true;
+    })(el)) continue;
       } catch (e) {}
     }
     var r = el.getBoundingClientRect();
@@ -1430,6 +2528,8 @@ def test_worker():
 
   try:
     driver = get_driver()
+    # 시작하자마자, 화면에 열린 세트와 불러온 단어가 같은지 맞춰본다.
+    ensure_word_list_for_screen(driver, min_gap=0)
 
     root.after(
         0,
@@ -1665,6 +2765,8 @@ def test_worker():
           print(f"[DEBUG] 고른 보기='{matched_text}' (번호 속성={digit})")
           pressed = _select_test_choice(driver, choice_el, digit, matched_text)
         print(f"[DEBUG] 매칭성공={pressed}")
+        if pressed:
+          _auto_card_done(current_word)
 
         if pressed and is_running:
           fail_counts.pop(current_cand_norm, None)
@@ -1718,6 +2820,12 @@ def test_worker():
             driver, _NEXT_CARD_LABELS, wait_after=0.4
         ):
           continue
+        # 화면에 열린 세트와 불러온 단어가 다르면 여기서 맞춘다.
+        if ensure_word_list_for_screen(driver):
+          continue
+        if warn_if_no_cards(driver):
+          time.sleep(1.0)
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
@@ -1764,7 +2872,25 @@ for (var i = 0; i < nodes.length; i++) {
   var vis = true;
   if (typeof el.checkVisibility === 'function') {
     try {
-      vis = el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+      vis = (function (e) {
+      // 창을 내려놓거나 다른 탭을 보고 있으면(document.hidden) 크롬의
+      // checkVisibility가 멀쩡히 그려진 것도 전부 false로 답한다.
+      // 그럴 때는 크기와 조상 스타일로 직접 판단한다.
+      if (!document.hidden) {
+        try { return e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}); }
+        catch (err) {}
+      }
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      var n = e;
+      while (n && n.nodeType === 1) {
+        var cs = getComputedStyle(n);
+        if (cs.display === "none" || cs.visibility === "hidden" ||
+            parseFloat(cs.opacity) === 0) return false;
+        n = n.parentElement;
+      }
+      return true;
+    })(el);
     } catch (e) {}
   }
   var r = el.getBoundingClientRect();
@@ -1920,18 +3046,37 @@ def match_scramble_sentence(groups):
     best_tie = False
 
     for word in word_list:
-      tokens = _sentence_tokens(word.get('eng', ''))
-      if not tokens or len(chips) > len(tokens):
-        continue
-      if not _is_submultiset(chips, tokens):
-        continue
+      eng = word.get('eng', '')
+      # '끊어읽기' 세트는 한 카드의 문장이 ' / '로 토막 나 있고, 사이트는
+      # 토막을 하나씩 따로 물어본다. 문장 전체로만 맞춰보면 조각이 모자라서
+      # 엉뚱하게 '문장 전체'를 누르려다 실패했다(한 토막마다 3초씩 허비).
+      # 그래서 문장 전체와 토막 하나하나를 모두 후보로 놓고 맞춰본다.
+      for cand in _sentence_chunks(eng):
+        tokens = _sentence_tokens(cand)
+        if not tokens or len(chips) > len(tokens):
+          continue
+        if not _is_submultiset(chips, tokens):
+          continue
 
-      extra = len(tokens) - len(chips)
-      if best is None or extra < best[0]:
-        best = (extra, word, tokens)
-        best_tie = False
-      elif extra == best[0] and word.get('eng') != best[1].get('eng'):
-        best_tie = True
+        extra = len(tokens) - len(chips)
+        if best is None or extra < best[0]:
+          best = (extra, word, tokens, cand)
+          best_tie = False
+        elif extra == best[0]:
+          # 후보가 둘이어도 '눌러야 할 낱말 순서'가 똑같으면 어느 쪽이든
+          # 상관없다. 예전에는 카드 이름이 다르기만 하면 무조건 포기했는데,
+          # 한 세트에 'Now I understand.'와 'Now I understand / a lot of
+          # them.'이 같이 들어 있으면(끊어읽기 세트에서 흔하다) 조각이
+          # ['Now','I','understand']로 똑같이 나와서 영영 안 풀었다.
+          if tokens != best[2]:
+            best_tie = True
+          elif (len(_sentence_chunks(word.get('eng', '') or ''))
+                > len(_sentence_chunks(best[1].get('eng', '') or ''))):
+            # 순서가 같다면 토막이 더 많은 카드로 잡아둔다. '아직 토막이
+            # 남았다'고 보면 제출을 안 하는데, 실제로 한 문장짜리였더라도
+            # 다음 화면(Good Job!/영작 연습하기)에서 알아서 넘어간다.
+            # 반대로 잘못 제출하면 토막이 남은 카드를 통째로 건너뛴다.
+            best = (extra, word, tokens, cand)
 
     if best is None:
       return None
@@ -1939,8 +3084,8 @@ def match_scramble_sentence(groups):
       print(f'[DEBUG] 조각만으로 문장을 특정할 수 없어 건너뜀 (남는 낱말 {best[0]}개)')
       return None
 
-    _, word, tokens = best
-    return usable, word, tokens
+    _, word, tokens, source = best
+    return usable, word, tokens, source
 
   return None
 
@@ -1995,7 +3140,25 @@ for (var i = 0; i < nodes.length && out.length < 300; i++) {
   if (!t || t.length > 300) continue;
   if (typeof el.checkVisibility === 'function') {
     try {
-      if (!el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) {
+      if (!(function (e) {
+      // 창을 내려놓거나 다른 탭을 보고 있으면(document.hidden) 크롬의
+      // checkVisibility가 멀쩡히 그려진 것도 전부 false로 답한다.
+      // 그럴 때는 크기와 조상 스타일로 직접 판단한다.
+      if (!document.hidden) {
+        try { return e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}); }
+        catch (err) {}
+      }
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      var n = e;
+      while (n && n.nodeType === 1) {
+        var cs = getComputedStyle(n);
+        if (cs.display === "none" || cs.visibility === "hidden" ||
+            parseFloat(cs.opacity) === 0) return false;
+        n = n.parentElement;
+      }
+      return true;
+    })(el)) {
         continue;
       }
     } catch (e) {}
@@ -2003,6 +3166,27 @@ for (var i = 0; i < nodes.length && out.length < 300; i++) {
   var r = el.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) continue;
   out.push(t);
+}
+
+// 리콜의 문장 줄(.input-box)은 낱말이 <div>로 하나씩 들어 있어서
+// textContent가 'Iusedthe'처럼 붙어버리고, 빈칸 표시(class 'now')가
+// '아직 안 누른 조각'으로 잡혀 줄 전체가 통째로 걸러졌다. 그래서 'I used
+// the'가 놓여 있어도 1낱말로만 읽혀서 시작 자리를 잘못 잡았다.
+// 자식 글자를 공백으로 이어 붙여 따로 넣는다.
+var boxes = document.querySelectorAll('.input-box');
+for (var b = 0; b < boxes.length; b++) {
+  var box = boxes[b];
+  var br = box.getBoundingClientRect();
+  if (br.width <= 0 || br.height <= 0) continue;
+  var words = [];
+  for (var c = 0; c < box.children.length; c++) {
+    var ch = box.children[c];
+    if (ch.classList && ch.classList.contains('now')) continue;  // 빈칸 표시
+    var ct = (ch.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!ct || /^[0-9]+\.$/.test(ct)) continue;  // 앞의 번호('1.')
+    words.push(ct);
+  }
+  if (words.length) out.push(words.join(' '));
 }
 return out;
 """
@@ -2086,7 +3270,38 @@ def _study_page_kind(driver):
   return ''
 
 
-def click_scramble_in_order(driver, tokens):
+def _case_token(text):
+  """_norm_token과 같지만 대소문자를 그대로 둔다.
+
+  'The plants clean the water by consuming the food.'처럼 같은 낱말이
+  대소문자만 다르게 여러 번 나오는 문장이 있다. 낱말 비교는 소문자로
+  하지만, 누를 조각을 고를 때는 대소문자까지 같은 조각을 먼저 골라야 한다.
+  사이트는 조각 글자를 그대로 비교해서, 'The' 자리에 'the'를 누르면
+  오답 처리한다(로그: 'the' 클릭이 안 먹은 듯 -> 그 문장 전부 오답)."""
+  t = _norm_quotes(text)
+  cleaned = re.sub(r"[^0-9A-Za-zÀ-ɏ]+", '', t)
+  return cleaned or t.strip()
+
+
+def _chip_match_rank(chip_text, raw_word):
+  """조각 글자가 원래 낱말과 얼마나 똑같은지. 작을수록 우선.
+
+  0 = 문장부호까지 완전히 같음, 1 = 대소문자까지 같음(부호만 다름),
+  2 = 소문자로는 같음, 3 = 그 밖에."""
+  if not raw_word:
+    return 2
+  a = _norm_quotes(chip_text).strip()
+  b = _norm_quotes(raw_word).strip()
+  if a == b:
+    return 0
+  if _case_token(a) == _case_token(b):
+    return 1
+  if _norm_token(a) == _norm_token(b):
+    return 2
+  return 3
+
+
+def click_scramble_in_order(driver, tokens, raw_tokens=None):
   """정답 순서대로 조각을 클릭한다.
 
   시작 자리는 처음 읽은 조각으로 한 번만 정하고, 그 뒤로는 우리가 누른
@@ -2182,11 +3397,17 @@ def click_scramble_in_order(driver, tokens):
       return True
 
     tok = tokens[idx]
+    raw_tok = raw_tokens[idx] if raw_tokens and idx < len(raw_tokens) else None
+    # 같은 낱말이 여러 개일 때 어느 조각을 누를지 고른다. 'This process is
+    # repeated again and again!'처럼 문장부호나 대소문자만 다른 조각이
+    # 같이 있는 경우가 있어서(again / again!), 원래 낱말과 가장 똑같은
+    # 조각부터 고른다. 순서를 어기면 사이트가 바로 오답 처리한다.
+    cands = [(el, txt) for el, txt in items if _norm_token(txt) == tok]
     target = None
-    for el, txt in items:
-      if _norm_token(txt) == tok:
-        target = el
-        break
+    if cands:
+      target = min(
+          cands, key=lambda it: (_chip_match_rank(it[1], raw_tok), cands.index(it))
+      )[0]
 
     if target is None:
       # 눌러야 할 낱말이 아직 트레이에 안 들어왔다. 잠깐 뒤에 다시 본다.
@@ -2239,10 +3460,23 @@ def click_scramble_in_order(driver, tokens):
       #    찾음'이 되는 바람에 눌린 걸 확인 못 하고 같은 조각을 다시 눌렀다.
       #    테스트는 이미 누른 조각을 또 누르면 오답(시간 차감)이다.
       try:
-        if driver.execute_script(
-            "return arguments[0].classList.contains('clicked');", target):
+        state = driver.execute_script(
+            "var el = arguments[0];"
+            "if (el.classList.contains('clicked')) return 'clicked';"
+            "if (el.classList.contains('shake') || el.classList.contains('wrong'))"
+            "  return 'wrong';"
+            "var p = el.parentElement;"
+            "return p && p.classList.contains('disabled') ? 'wrong' : '';", target)
+        if state == 'clicked':
           landed = True
           break
+        if state == 'wrong':
+          # 사이트가 이 조각을 오답으로 처리했다(shake + 조각 줄 disabled).
+          # 예전엔 조각 줄이 다시 그려진 걸 '눌렸다'로 착각해서 클릭 방식을
+          # 잘못 바꾸고(0.08초 -> 0.44초) 그대로 진행했다.
+          print(f"[DEBUG] '{tok}'이(가) 오답 처리됨 - 이번 문장 중단")
+          report()
+          return False
       except StaleElementReferenceException:
         # 눌린 뒤 조각 줄이 새로 그려져 요소가 사라졌다 = 눌린 것.
         landed = True
@@ -2347,6 +3581,8 @@ def sentence_scramble_worker(mode_name='문장'):
 
   try:
     driver = get_driver()
+    # 시작하자마자, 화면에 열린 세트와 불러온 단어가 같은지 맞춰본다.
+    ensure_word_list_for_screen(driver, min_gap=0)
     root.after(
         0,
         lambda: lbl_status.config(
@@ -2358,6 +3594,7 @@ def sentence_scramble_worker(mode_name='문장'):
     solved_key = None
     stuck = 0
     open_logged = False
+    open_tries = 0
 
     while is_running:
       # 덜 배열한 채 제출하면 확인창이 뜨고, 그게 떠 있는 동안은 조각을
@@ -2399,16 +3636,41 @@ def sentence_scramble_worker(mode_name='문장'):
           if not open_logged:
             print('[DEBUG] 영작 연습하기 화면 - 스페이스로 문제 열기')
             open_logged = True
+          open_tries += 1
+          if open_tries == 8 and not warn_if_no_cards(driver):
+            # 주소를 직접 치거나 새로고침해서 들어오면, 사이트가 카드를
+            # 하나도 안 내주는 때가 있다(화면 위 숫자가 '0/12'가 아니라
+            # '0/0'이고, 지난번에 하던 다른 세트의 문장이 남아 있다).
+            # 그러면 [영작 연습하기]를 아무리 눌러도 화면이 안 넘어간다.
+            # 예전에는 여기서 아무 말 없이 계속 누르기만 했다.
+            print('[DEBUG] [영작 연습하기]를 여러 번 눌러도 화면이 안 넘어감')
+            root.after(0, lambda: lbl_status.config(
+                text='화면이 안 넘어갑니다. 세트 화면에서 학습 버튼을 눌러\n'
+                     '다시 들어와 주세요. (주소를 직접 열면 안 될 때가 있어요)',
+                fg='#D32F2F'))
           press_space(driver)
-          time.sleep(0.4)  # 사용자 요청으로 살짝 빠르게 (0.55 -> 0.4)
+          time.sleep(0.25)  # 사용자 요청으로 점점 빠르게 (0.55 -> 0.4 -> 0.25)
+          # 자동으로 주소를 열고 들어오면 이 버튼에 스페이스 단축키
+          # (data-hotkey)가 안 붙어 있는 경우가 있다. 그때는 스페이스를
+          # 아무리 보내도 화면이 안 넘어가서, 버튼을 직접 누른다.
+          if find_button_by_text(driver, _WRITE_PRACTICE_LABELS):
+            print('[DEBUG] 스페이스가 안 먹어서 [영작 연습하기]를 직접 누름')
+            click_button_by_text(driver, _WRITE_PRACTICE_LABELS, wait_after=0.6)
           continue
         open_logged = False
         if handle_section_done(driver):
           solved_key = None
           continue
+        # 'Good Job!' + [한번 더]/[다음 카드]만 있는 화면. 스페이스가 안 먹는다.
+        if click_button_by_text(driver, _NEXT_CARD_LABELS, wait_after=0.2):
+          solved_key = None
+          continue
         if groups:
           print(f"[DEBUG] 조각은 보이는데 맞는 문장이 없음={[[t for _, t in g] for g in groups]}")
         focus_study_tab(driver)
+        # 화면에 열린 세트와 불러온 문장이 다르면 여기서 맞춘다.
+        if ensure_word_list_for_screen(driver):
+          continue
         root.after(
             0,
             lambda: lbl_status.config(
@@ -2418,31 +3680,65 @@ def sentence_scramble_worker(mode_name='문장'):
         time.sleep(0.3)
         continue
 
-      items, word, tokens = matched
+      items, word, tokens, source = matched
+      open_tries = 0
       key = tuple(sorted(_norm_token(t) for _, t in items))
 
       if key == solved_key:
         # 방금 푼 화면이 아직 안 넘어갔다. 조각을 또 누르면 답이 망가지므로
         # 스페이스만 다시 보낸다. 그래도 안 넘어가면 같은 문장이 또 나온
         # 것으로 보고 다시 푼다.
+        #
+        # 예전에는 0.5초씩 통째로 쉬면서 여섯 번까지 기다렸다. 그래서 문장을
+        # 하나 풀 때마다 3초씩 노는 것처럼 보였다. 이제는 0.12초마다 화면을
+        # 들여다보고(다음 문장이 뜨는 즉시 바로 시작), 스페이스는 예전처럼
+        # 0.5초에 한 번씩만 보낸다(너무 자주 보내면 문장을 건너뛸 수 있다).
         stuck += 1
-        if stuck > 6:
+        if stuck > 14:   # 0.12초씩 -> 1.7초쯤 보고 포기한다(예전 2.9초)
           print('[DEBUG] 같은 문장이 계속 떠서 다시 푼다')
           solved_key = None
           stuck = 0
         else:
-          press_space(driver)
-          time.sleep(0.5)
+          if stuck % 2 == 1:
+            press_space(driver)
+          time.sleep(0.12)
         continue
 
       print(
-          f"[DEBUG] 조각들={[t for _, t in items]} -> 정답 문장='{word['eng']}'"
+          f"[DEBUG] 조각들={[t for _, t in items]} -> 맞출 부분='{source.strip()}'"
       )
       msg = f"문장 감지: {word['eng']}"
       root.after(0, lambda m=msg: lbl_status.config(text=m, fg='#0288D1'))
 
-      done = click_scramble_in_order(driver, tokens)
+      # 문장부호까지 그대로 둔 원래 낱말들(조각 고를 때 기준).
+      # 끊어읽기 세트면 맞춘 '토막'만 쓴다(문장 전체가 아니라).
+      raw_tokens = [
+          w for w in _norm_quotes(source).split() if _norm_token(w)
+      ]
+      if len(raw_tokens) != len(tokens):
+        raw_tokens = None
+      # 이 카드에 아직 풀 토막이 남았는지 본다.
+      #
+      # '끊어읽기' 세트는 카드 하나가 ' / '로 토막 나 있고, 한 토막을 맞히면
+      # 사이트가 같은 카드의 다음 토막을 이어서 보여준다. 그런데 매크로가
+      # 토막마다 ENTER(제출)를 눌러서, 카드를 다 못 끝내고 다음 카드로
+      # 넘어가 버렸다. 그래서 문장 암기 진도가 50%에서 더 안 올랐다
+      # (한 토막짜리 카드만 제대로 끝났다).
+      chunks = _sentence_chunks(word.get('eng', '') or '')
+      parts = chunks[1:] if len(chunks) > 1 else chunks
+      more_chunks = (len(parts) > 1
+                     and source.strip() != chunks[0].strip()
+                     and source.strip() != parts[-1].strip())
+
+      done = click_scramble_in_order(driver, tokens, raw_tokens)
       print(f'[DEBUG] 배열성공={done}')
+      if done:
+        # 토막을 한꺼번에 물어본 화면이면 그 카드의 토막을 모두 센다.
+        if len(chunks) > 1 and source.strip() == chunks[0].strip():
+          for part in parts:
+            _auto_card_done(part)
+        else:
+          _auto_card_done(source)
 
       if done and is_running:
         solved_key = key
@@ -2456,7 +3752,11 @@ def sentence_scramble_worker(mode_name='문장'):
         # 사용자 요청으로 살짝 빠르게 (0.2/0.45 -> 0.1/0.35). 테스트는 아직
         # 실제로 확인을 안 해서 원래 값 그대로 둔다.
         in_test = on_class_test(driver)
-        if in_test:
+        if more_chunks and not in_test:
+          # 같은 카드의 다음 토막이 이어서 나온다. 여기서 제출하면 카드를
+          # 통째로 넘겨버리므로 아무것도 누르지 않고 다음 토막을 푼다.
+          time.sleep(0.15)
+        elif in_test:
           # 테스트는 다 맞추면 사이트가 알아서 채점하고 [다음 문제](ENTER)를
           # 띄운다. 예전엔 ENTER 한 번 + 0.45초 쉬고 다음 반복에서 버튼을
           # 찾느라 살짝 늦었다. 버튼이 뜨는 순간을 0.05초 간격으로 지켜보다가
@@ -2466,9 +3766,9 @@ def sentence_scramble_worker(mode_name='문장'):
           press_submit(driver)
           _press_next_question_when_ready(driver, timeout=2.0)
         else:
-          time.sleep(0.1)
           press_submit(driver)
-          time.sleep(0.35)
+          # 다음 화면('문장 확인' 또는 바로 다음 문제)이 나오는 즉시 움직인다.
+          _wait_next_sentence(driver, key)
       else:
         time.sleep(0.5)
 
@@ -2482,6 +3782,524 @@ def sentence_scramble_worker(mode_name='문장'):
     )
   finally:
     root.after(0, stop_macro)
+
+
+# --- 완전 자동 학습 ---
+#
+# 클래스 -> 세트 -> 목표(%)를 고르면, 세트마다 단어/문장을 사이트에서 직접
+# 읽어와 암기 -> 리콜 -> 스펠 (-> 테스트) 순서로 알아서 돌린다.
+auto_running = False
+auto_mode_done = threading.Event()
+
+# 이번 모드에서 카드를 몇 장 했는지 센다.
+#
+# 사이트가 '세트를 다 끝냈다'는 걸 모드마다 다르게 보여준다. 암기/리콜은
+# 멈출 수 있는 화면이 뜨는데 스펠은 안 떠서, 스펠이 100%에서 안 멈추고
+# 340%까지 같은 단어를 계속 돌았다. 그래서 화면 대신 '서로 다른 카드를
+# 몇 장 했는지'를 센다. 세트의 카드를 전부 한 번씩 했으면 한 바퀴다.
+auto_cards_done = 0
+auto_cards_seen = set()
+
+# 지금 무엇을 하고 있는지 적어두는 값들.
+# 예전에는 이걸로 세트 줄에 '▶ 스펠 12/25' 같은 실시간 진도를 보여줬는데,
+# 숫자가 실제와 안 맞을 때가 많아서(카드를 다시 보여주거나 토막으로 쪼개는
+# 세트가 있다) 표시를 없앴다. auto_cards_total은 '한 바퀴 다 돌았나'를
+# 판단하는 데 계속 쓴다.
+auto_cur_idx = None      # 지금 학습 중인 세트 번호
+auto_cur_mode = None     # 'memorize' / 'recall' / 'spell' / 'test'
+auto_cards_total = 0     # 이 세트의 카드 수
+
+
+_PROGRESS_JS = r'''
+// 학습 화면 위쪽의 진행 표시('6/12')를 읽는다. 사이트가 세는 방식이
+// 가장 정확하다(끊어읽기 세트는 토막이 여러 개라도 카드 하나로 센다).
+var t = (document.body.innerText || '').split('\n');
+for (var i = 0; i < t.length; i++) {
+  var m = t[i].trim().match(/^([0-9]+)\s*\/\s*([0-9]+)$/);
+  if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+}
+return null;
+'''
+
+# 사이트가 말하는 '몇 장 중 몇 장'. 워커 갈래에서만 채운다.
+auto_site_done = 0
+auto_site_total = 0
+
+
+def _read_study_progress():
+  """학습 화면의 진행 표시를 읽어 적어둔다. (워커 갈래에서만 부를 것)"""
+  global auto_site_done, auto_site_total
+  driver = shared_driver
+  if driver is None:
+    return
+  try:
+    out = driver.execute_script(_PROGRESS_JS)
+  except Exception:
+    return
+  if out and len(out) == 2:
+    before = (auto_site_done, auto_site_total)
+    auto_site_done, auto_site_total = int(out[0]), int(out[1])
+    if (auto_site_done, auto_site_total) != before:
+      print(f'[DEBUG] 사이트 진행 {auto_site_done}/{auto_site_total}')
+
+
+def _study_unit_count(cards):
+  """한 바퀴에 몇 장을 풀어야 하는지.
+
+  '끊어읽기' 문장 세트는 카드 하나가 ' / '로 토막 나 있고 사이트는 토막마다
+  한 문제씩 낸다. 카드 수로만 세면 절반만 하고 '한 바퀴 끝'이라고 착각한다
+  (12카드 세트를 12장 풀고 끝냈는데 진도는 50%였다)."""
+  total = 0
+  for card in cards or []:
+    parts = _sentence_chunks(card.get('eng', '') or '')
+    total += len(parts) - 1 if len(parts) > 1 else 1
+  return total
+
+
+def _auto_card_done(word=None):
+  """워커가 카드 한 장(문장 하나)을 끝낼 때마다 부른다."""
+  global auto_cards_done
+  if not auto_running:
+    return
+  auto_cards_done += 1
+  if isinstance(word, dict):
+    word = word.get('eng')
+  if word:
+    auto_cards_seen.add(str(word).strip().lower())
+  _read_study_progress()
+
+
+_MODE_PATH = {'memorize': 'Memorize', 'recall': 'Recall', 'spell': 'Spell'}
+_MODE_NAME = {'memorize': '암기', 'recall': '리콜', 'spell': '스펠'}
+
+
+def _auto_status(text, color='#0288D1'):
+  def work():
+    for label in ('lbl_auto_status', 'lbl_status'):
+      widget = globals().get(label)
+      if widget is not None:
+        try:
+          widget.config(text=text, fg=color)
+        except Exception:
+          pass
+  root.after(0, work)
+
+
+def _auto_log(text):
+  print('[AUTO] ' + text)
+  _auto_status(text)
+
+
+def _auto_run_worker(target, cards=0, timeout=1800):
+  """워커를 돌리고 이 모드를 한 바퀴 돌 때까지 기다린다.
+
+  끝난 걸 두 가지로 알아챈다.
+  1) 세트 완료 화면(handle_section_done이 auto_mode_done을 세운다)
+  2) 카드를 세트 장수만큼 처리했을 때 — 완료 화면의 버튼 이름이 모드마다
+     달라서 1)을 놓치는 일이 있었다(스펠이 100%에서 안 멈추고 340%까지
+     돌았다). 한 바퀴어치를 다 했으면 화면이 뭐라고 하든 여기서 끊는다."""
+  global is_running, auto_cards_done
+  global auto_site_done, auto_site_total
+  auto_mode_done.clear()
+  auto_cards_done = 0
+  auto_cards_seen.clear()
+  auto_site_done = auto_site_total = 0
+  t = threading.Thread(target=target, daemon=True)
+  t.start()
+  end = time.time() + timeout
+  while t.is_alive() and auto_running and time.time() < end:
+    if auto_mode_done.is_set():
+      break
+    # 사이트가 '12/12'처럼 다 했다고 하면 그게 가장 정확하다.
+    if auto_site_total and auto_site_done >= auto_site_total:
+      print(f'[AUTO] 사이트 진행 {auto_site_done}/{auto_site_total} - 한 바퀴 끝')
+      auto_mode_done.set()
+      break
+    # 서로 다른 카드를 세트 장수만큼 했으면 한 바퀴를 다 돈 것이다.
+    if cards and len(auto_cards_seen) >= cards:
+      print(f'[AUTO] 카드 {cards}장을 한 번씩 다 해서 한 바퀴 끝')
+      auto_mode_done.set()
+      break
+    # 카드 이름을 못 세는 모드(암기)를 위한 안전장치. 두 바퀴어치를 넘기면
+    # 끊는다.
+    if cards and auto_cards_done >= cards * 2:
+      print(f'[AUTO] 카드를 {auto_cards_done}번 했는데 안 끝나서 여기서 끊는다')
+      auto_mode_done.set()
+      break
+    time.sleep(0.2)
+  is_running = False
+  memo_go.clear()
+  t.join(timeout=5)
+  return auto_mode_done.is_set()
+
+
+_EMPTY_STUDY_JS = r"""
+// 이 화면에 공부할 카드가 남아 있는지. 진행 표시가 '0/0'이면 그 구간은
+// 이미 다 한 것이라 아무 일도 일어나지 않는다(자동 진행이 여기서 멈췄다).
+var t = (document.body.innerText || '').replace(/\s+/g, ' ');
+return /(^|\s)0\s*\/\s*0(\s|$)/.test(t);
+"""
+
+
+def _auto_nothing_to_study(driver):
+  try:
+    return bool(driver.execute_script(_EMPTY_STUDY_JS))
+  except Exception:
+    return False
+
+
+_FIND_TEXT_EL_JS = r"""
+// 화면에 보이는 요소 중 글자가 정확히 같은 것 하나를 돌려준다.
+var want = arguments[0];
+var els = document.querySelectorAll('a, div, label, span, button');
+for (var i = 0; i < els.length; i++) {
+  var e = els[i];
+  if (e.children.length) continue;
+  if ((e.textContent || '').replace(/\s+/g, ' ').trim() !== want) continue;
+  var r = e.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) continue;
+  return e;
+}
+return null;
+"""
+
+
+def _auto_click_text(driver, text):
+  """그 글자가 적힌 것을 누른다."""
+  try:
+    el = driver.execute_script(_FIND_TEXT_EL_JS, text)
+  except Exception:
+    return False
+  if not el:
+    return False
+  try:
+    el.click()
+  except Exception:
+    try:
+      driver.execute_script('arguments[0].click();', el)
+    except Exception:
+      return False
+  return True
+
+
+def _auto_handle_start_screen(driver, item, mode):
+  """모드에 들어가면 먼저 나오는 '학습방법 고르고 시작' 화면을 넘긴다.
+
+  단어 세트는 [단어 제시]로, 문장 스펠은 [어순배열]로 맞춘 뒤
+  'OO 학습 시작' 버튼을 누른다. 매크로가 이 방식에 맞춰져 있다."""
+  try:
+    btns = [b for b in driver.find_elements(By.CSS_SELECTOR, 'a.btn-opt-start')
+            if b.is_displayed()]
+  except Exception:
+    return False
+  if not btns:
+    return False
+  if item.get('sentence'):
+    want = '어순배열' if mode == 'spell' else None
+  else:
+    want = '단어 제시'
+  if want:
+    _auto_click_text(driver, want)
+    time.sleep(0.2)
+  try:
+    btns[0].click()
+  except Exception:
+    try:
+      driver.execute_script('arguments[0].click();', btns[0])
+    except Exception:
+      return False
+  print(f'[AUTO] 학습 시작 화면 넘김 ({want or "기본 설정"})')
+  time.sleep(0.7)
+  return True
+
+
+def _auto_study_mode(driver, mode, item, class_idx):
+  """한 모드를 한 바퀴 돌린다(세트 진도 +100%).
+
+  중요: 한 구간이 끝나면 사이트가 알아서 다음 구간으로 이어준다. 그래서 한 번
+  들어가면 세트 끝까지 간다. 예전에는 그걸 모르고 구간마다 따로 들어가서,
+  1구간에 들어가 놓고 세트를 통째로 한 바퀴 돌고, 다시 2구간에 들어가 또 한
+  바퀴 도는 식이었다(25카드 세트가 암기 300%). 눈으로 보면 같은 단어를 계속
+  반복하니 '암기를 무한정 한다'고 보였다.
+
+  그래서 이제는 '아직 안 끝낸 첫 구간'에서 한 번만 들어간다. 목표가 100%보다
+  높으면 auto_worker가 바깥에서 한 바퀴씩 더 돌린다.
+
+  ('전체 카드로 하기'를 고르는 단추가 있었는데, 어차피 결과가 같아서 없앴다.
+   구간이 다 끝나 있을 때만 아래에서 전체 카드로 한 바퀴 돈다.)"""
+  segments = item.get('segments') or [1]
+  seg_done = item.get('seg_done') or {}
+  start = None
+  for seg in segments:
+    if not (seg_done.get(str(seg)) or {}).get(mode):
+      start = seg
+      break
+
+  if start is not None:
+    if start != segments[0]:
+      print(f'[AUTO] {_MODE_NAME[mode]}: 앞 구간은 이미 100%라 {start}구간부터')
+    if _auto_study_segment(driver, mode, item, class_idx, start):
+      return True
+    if not auto_running:
+      return False
+  # 구간이 다 끝나 있거나 그 구간에 할 게 없으면 전체 카드로 한 바퀴 돈다.
+  print(f'[AUTO] {_MODE_NAME[mode]}: 전체 카드로 한 바퀴 돈다')
+  return _auto_study_segment(driver, mode, item, class_idx, 6000)
+
+
+def _auto_study_segment(driver, mode, item, class_idx, seg):
+  url = f"{_SITE}/{_MODE_PATH[mode]}/{item['idx']}/{seg}/{class_idx}"
+  try:
+    driver.get(url)
+  except Exception as e:
+    _auto_log(f'주소 이동 실패: {str(e).splitlines()[0][:60]}')
+    return False
+  _wait_page_ready(driver, 6.0)
+  time.sleep(0.4)
+  _auto_handle_start_screen(driver, item, mode)
+  # '0/0'은 화면이 아직 덜 그려졌을 때도 잠깐 나온다. 두 번 연속일 때만
+  # 건너뛴다(5구간이 아직 안 끝났는데 건너뛴 적이 있다).
+  if _auto_nothing_to_study(driver):
+    time.sleep(1.2)
+    if _auto_nothing_to_study(driver):
+      print(f"[AUTO] {_MODE_NAME[mode]} {seg}구간은 공부할 카드가 없어 건너뜀")
+      return False
+  where = '전체 카드' if seg >= 1000 else f'{seg}구간'
+  # 창이 가려져 있으면 크롬이 화면 그리기를 멈춰서 글자를 못 읽는다.
+  # 계속 그려달라고 다시 한 번 부탁한다(탭마다 따로 해줘야 한다).
+  try:
+    if driver.execute_script('return document.hidden;'):
+      _keep_page_awake(driver)
+      time.sleep(0.4)
+      if driver.execute_script('return document.hidden;'):
+        _auto_log('크롬 창이 가려져 있어 화면을 못 읽습니다. 크롬 창을 열어두세요.')
+  except Exception:
+    pass
+  _auto_log(f"{item['name']} · {_MODE_NAME[mode]} 학습 중 ({where})")
+
+  if item.get('sentence'):
+    worker = lambda: sentence_scramble_worker(_MODE_NAME[mode])
+  else:
+    worker = {
+        'memorize': memo_worker,
+        'recall': selenium_worker,
+        'spell': spelling_worker,
+    }[mode]
+    if mode == 'memorize':
+      # 단어 암기는 평소엔 사람이 [시작]을 누를 때까지 기다린다.
+      memo_go.set()
+
+  # 이 구간은 한 번만 한다.
+  #
+  # 예전에는 여기서 '세트 전체 진도'가 목표에 닿을 때까지 같은 구간을 계속
+  # 다시 돌렸다(완료 화면의 'N% 도전'). 그런데 한 구간을 끝내봐야 세트 진도는
+  # 1/구간수 만큼만 오르기 때문에, 1구간을 세 번 돌리고 2구간을 또 세 번
+  # 돌리는 식이 됐다. 눈으로 보면 '암기를 무한정 반복'하는 것처럼 보였고,
+  # 실제로 암기 300%가 되도록 같은 카드만 돌았다.
+  # 구간을 한 바퀴 다 돌면 세트 진도가 100% 오르므로, 목표가 더 높으면
+  # auto_worker가 바깥에서 한 바퀴를 더 돌린다.
+  global auto_cur_idx, auto_cur_mode, auto_cards_total
+  auto_cur_idx, auto_cur_mode = str(item['idx']), mode
+  auto_cards_total = _study_unit_count(word_list)
+  try:
+    return _auto_run_worker(worker, cards=auto_cards_total)
+  finally:
+    auto_cur_mode = None
+
+
+def _auto_study_test(driver, item, class_idx):
+  """테스트(최종 시험)를 자동으로 시작하고 끝까지 푼다."""
+  url = f"{_SITE}/ClassTest/{class_idx}/{item['idx']}?p=1&ex=1"
+  try:
+    driver.get(url)
+  except Exception:
+    return False
+  _keep_page_awake(driver)
+  time.sleep(1.5)
+  _auto_log(f"{item['name']} · 테스트 시작")
+  # 문제가 나오기 전에 안내 화면이 여러 장 나온다. 선생님이 만든 테스트는
+  # '1차 테스트' 같은 표지가 먼저 뜨고 [다음]을 눌러야 넘어간다.
+  # 화면마다 버튼 이름이 달라서(테스트 시작 / 응시 / 새로 시작 / 다음 /
+  # 시작하기) 다 넣어두고, 문제 카드가 나올 때까지 계속 눌러준다.
+  # 누르는 순서가 중요하다. '진행 중이던 테스트가 있습니다' 창이 떠 있으면
+  # 그 창의 [응시]부터 눌러야 한다. 뒤에 가려진 [테스트 시작]을 눌러봐야
+  # 화면이 안 넘어가서, 예전에는 같은 버튼을 1초에 수십 번씩 눌렀다.
+  labels = ['응시', '새로 시작', '테스트 시작', '다음', '시작하기']
+  misses = 0
+  end = time.time() + 30
+  while auto_running and time.time() < end:
+    try:
+      # 문제 카드가 나왔으면 그만 누른다(문제 화면의 버튼을 잘못 누르면
+      # 문제를 건너뛸 수 있다).
+      if driver.find_elements(By.CSS_SELECTOR, '.flip-card'):
+        break
+    except Exception:
+      pass
+    clicked = None
+    for label in labels:
+      if click_button_by_text(driver, [label], wait_after=0):
+        clicked = label
+        break
+    if clicked:
+      print(f'[AUTO] 테스트 시작 화면: [{clicked}] 누름')
+      misses = 0
+      time.sleep(1.2)   # 다음 화면이 그려질 때까지 기다린다
+      continue
+    misses += 1
+    if misses >= 6:
+      break
+    time.sleep(0.4)
+  if not auto_running:
+    return False
+  worker = (lambda: sentence_scramble_worker('테스트')) if item.get('sentence') else test_worker
+  global auto_cur_idx, auto_cur_mode, auto_cards_total
+  auto_cur_idx, auto_cur_mode = str(item['idx']), 'test'
+  auto_cards_total = _study_unit_count(word_list)
+  try:
+    done = _auto_run_worker(worker, cards=auto_cards_total)
+  finally:
+    auto_cur_mode = None
+  # 사람이 하듯 결과 화면에서 홈(클래스 화면)으로 돌아온다. 그래야 다음
+  # 세트를 읽을 때 이 탭을 그대로 쓸 수 있다(안 그러면 새 탭이 생긴다).
+  if auto_running:
+    _open_site(driver, f'/ClassMain/{class_idx}')
+    # 방금 본 테스트 점수까지 화면에 바로 반영한다.
+    got = (fetch_class_report(driver, class_idx) or {}).get(str(item['idx']))
+    if got:
+      fresh = {m: (got.get(m) or 0) for m in ('memorize', 'recall', 'spell')}
+      fresh['test'] = got.get('test') or ''
+      root.after(0, lambda r=fresh, i=item['idx']: _ui_set_rate_by_idx(i, r))
+  return done
+
+
+def _auto_rates(driver, item, class_idx):
+  """세트의 지금 진도(%)를 다시 읽는다.
+
+  공부하던 화면을 그대로 두고 세트 페이지 내용만 받아와서 읽는다.
+  (예전에는 세트 페이지로 '이동'해서 읽었는데, 학습 중에 그러다 보니 자주
+  실패해서 진도가 계속 0%로 보였다. 그래서 암기가 다 끝났는데도 목표에 못
+  미친 줄 알고 같은 걸 다섯 바퀴나 더 돌았다.)"""
+  found = fetch_set_rates(driver, class_idx, [item['idx']])
+  got = found.get(str(item['idx']))
+  if not got:
+    detail = fetch_set_detail(driver, item['idx'], class_idx)
+    if not detail:
+      return {}
+    got = detail
+  # 진도 표시가 아예 없으면 아직 한 번도 안 한 것이다(0%).
+  return {m: (got.get(m) or 0) for m in ('memorize', 'recall', 'spell')}
+
+
+def _next_auto_set(done_idx):
+  """다음에 학습할 세트를 고른다. 없으면 None.
+
+  시작할 때 목록을 못 박아두지 않고 그때그때 화면의 체크를 본다. 그래서
+  학습이 도는 중에 세트를 더 체크해도 끝나는 대로 이어서 해 준다(체크를
+  풀면 아직 안 한 세트는 빠진다)."""
+  picked = dict(_ui_checked)  # 다른 갈래에서 바뀌는 중일 수 있어 복사해서 쓴다
+  for item in list(_ui_sets):
+    idx = str(item['idx'])
+    if idx in done_idx or idx not in picked:
+      continue
+    return dict(item, target=picked[idx])
+  return None
+
+
+def auto_worker(plan):
+  """고른 세트들을 목표 퍼센트까지 자동으로 학습한다."""
+  global is_running, word_list, auto_running, auto_cur_mode
+  auto_running = True
+  try:
+    driver = get_driver()
+  except Exception as e:
+    root.after(0, lambda: messagebox.showerror('자동 학습', f'크롬을 열지 못했습니다:\n{e}'))
+    auto_running = False
+    return
+
+  class_idx = plan['class_idx']
+  done_idx = set()
+  try:
+    while auto_running:
+      item = _next_auto_set(done_idx)
+      if item is None:
+        break
+      done_idx.add(str(item['idx']))
+      detail = fetch_set_detail(driver, item['idx'], class_idx)
+      if not detail or not detail.get('cards'):
+        _auto_log(f"{item['name']}: 카드를 못 읽어서 건너뜀")
+        continue
+      word_list = detail['cards']
+      item = dict(item)
+      item['sentence'] = bool(item.get('sentence'))
+      item['segments'] = detail.get('segments') or [1]
+      item['seg_done'] = detail.get('seg_done') or {}
+      item['rates'] = {m: detail.get(m) for m in ('memorize', 'recall', 'spell')}
+      root.after(0, lambda v=('sentence' if item['sentence'] else 'word'):
+                 (study_kind.set(v), on_kind_change()))
+      _auto_log(f"{item['name']}: 카드 {len(word_list)}개 불러옴"
+                f" ({'문장' if item['sentence'] else '단어'})")
+
+      rates = {m: detail.get(m) or 0 for m in ('memorize', 'recall', 'spell')}
+      for mode in ('memorize', 'recall', 'spell'):
+        # 세트마다 목표를 따로 정할 수 있다(메인 화면의 'OO%까지').
+        target = item.get('target') or (plan.get('targets') or {}).get(mode) or 0
+        item['target'] = target
+        rounds = 0
+        # 한 번 들어가면 '구간 하나'를 끝내고 나온다(42카드 세트는 10장씩
+        # 4구간). 그래서 세트 하나를 100%까지 하려면 구간 수만큼 들어갔다
+        # 나와야 한다. 예전엔 5번으로 막아둬서, 구간이 6개 넘는 세트는
+        # 100%를 못 채우고 끝났다.
+        while auto_running and target and (rates.get(mode) or 0) < target and rounds < 12:
+          rounds += 1
+          _auto_log(f"{item['name']} · {_MODE_NAME[mode]} "
+                    f"{rates.get(mode) or 0}% -> 목표 {target}%")
+          if not _auto_study_mode(driver, mode, item, class_idx):
+            break
+          rates = _auto_rates(driver, item, class_idx) or rates
+          root.after(0, lambda r=dict(rates), i=item['idx']:
+                     _ui_set_rate_by_idx(i, r))
+          # 한 바퀴를 막 끝낸 직후에는 사이트가 진도를 아직 안 올려놨을 때가
+          # 있다. 그걸 '아직 모자라다'고 보고 한 바퀴를 더 도는 바람에
+          # 100%면 될 것을 200%까지 했다. 모자라 보이면 잠깐씩 두고 다시 본다.
+          # (통째로 2.5초 자니 모드 넘어가는 게 굼떠서 0.6초씩 세 번 본다)
+          for _ in range(3):
+            if not auto_running or (rates.get(mode) or 0) >= target:
+              break
+            time.sleep(0.6)
+            rates = _auto_rates(driver, item, class_idx) or rates
+            root.after(0, lambda r=dict(rates), i=item['idx']:
+                       _ui_set_rate_by_idx(i, r))
+      if plan['test'] and auto_running:
+        # 이미 통과한 테스트는 다시 보지 않는다.
+        # (예전에는 기록이 있든 없든 무조건 한 번 더 응시했다. 90점으로
+        #  통과해 놓은 세트를 체크하면 또 쳐서 불편했다.)
+        # 떨어진(FAIL) 기록은 '안 한 것'으로 보고 다시 친다.
+        got = (fetch_class_report(driver, class_idx) or {}).get(str(item['idx'])) or {}
+        prev_test = got.get('test') or ''
+        if prev_test and not _test_failed(prev_test):
+          _auto_log(f"{item['name']} · {_test_text(prev_test)} - 이미 통과해서 테스트는 건너뜀")
+          root.after(0, lambda i=item['idx'], t=prev_test:
+                     _ui_set_rate_by_idx(i, {'test': t}))
+        else:
+          _auto_study_test(driver, item, class_idx)
+      _auto_log(f"{item['name']} 끝 (암기 {rates.get('memorize')}% /"
+                f" 리콜 {rates.get('recall')}% / 스펠 {rates.get('spell')}%)")
+  except Exception as e:
+    err = str(e)
+    root.after(0, lambda: messagebox.showerror('자동 학습', f'오류가 발생했습니다:\n{err}'))
+  finally:
+    auto_running = False
+    is_running = False
+    auto_cur_mode = None
+    _auto_status('자동 학습 끝', '#388E3C')
+    root.after(0, stop_macro)
+
+
+def stop_auto():
+  """자동 학습 정지."""
+  global auto_running
+  auto_running = False
+  auto_mode_done.set()
 
 
 # --- 단어 / 문장 전환 ---
@@ -2566,6 +4384,493 @@ def on_kind_change():
   )
 
 
+# --- 메인 화면(자동 학습) 동작 ---
+#
+# 프로그램을 켜면 바로 이 화면이다. 왼쪽에 내 클래스, 오른쪽에 그 클래스의
+# 세트가 줄줄이 나오고, 세트마다 목표 퍼센트를 정해서 [자동 시작]을 누르면
+# 암기 -> 리콜 -> 스펠 -> 테스트까지 알아서 돈다.
+_ui_classes = []
+_ui_sets = []
+_ui_rows = []
+_ui_class_idx = None
+
+# 지금 체크돼 있는 세트 {세트번호: 목표%}.
+#
+# 체크 표시는 화면 위젯에 들어 있는데, 자동 학습은 다른 갈래(스레드)에서
+# 돌기 때문에 위젯을 직접 들여다보면 안 된다. 그래서 0.7초마다 화면을 훑어
+# 이 dict에 옮겨 적고, 자동 학습은 이것만 본다. 덕분에
+#  - 학습 중에 세트를 더 체크하면 그 세트도 이어서 학습하고,
+#  - 목록을 다시 그려도 체크가 그대로 살아난다.
+_ui_checked = {}
+
+
+def _goal_value(text):
+  """목표 퍼센트를 다듬는다. 최소 100, 100 단위로만 쓴다.
+
+  사이트가 한 바퀴에 100%씩 올려주기 때문에 100보다 작거나 애매한 숫자(150 등)는
+  의미가 없다. 150을 적으면 200으로 올려서 한 바퀴를 더 돌게 한다."""
+  try:
+    value = int(float(str(text).strip() or 100))
+  except Exception:
+    return 100
+  if value <= 100:
+    return 100
+  return ((value + 99) // 100) * 100
+
+
+def _ui_collect_checked():
+  """지금 화면에서 체크된 세트와 목표%를 모은다. (화면 갈래에서만 부를 것)"""
+  now = {}
+  for row in _ui_rows:
+    if not row['var'].get():
+      continue
+    now[str(row['item']['idx'])] = _goal_value(row['goal'].get())
+  return now
+
+
+def _ui_sync_checked():
+  """화면의 체크/목표를 _ui_checked에 옮겨 적는다(0.7초마다)."""
+  try:
+    if _ui_rows:
+      now = _ui_collect_checked()
+      _ui_checked.clear()
+      _ui_checked.update(now)
+  except Exception:
+    pass
+  root.after(700, _ui_sync_checked)
+
+
+def _ui_status(text, color='gray'):
+  def work():
+    try:
+      lbl_auto_status.config(text=text, fg=color)
+    except Exception:
+      pass
+  root.after(0, work)
+
+
+def _ui_load_classes():
+  """크롬에서 내 클래스 목록을 읽어 왼쪽에 채운다."""
+
+  def work():
+    global _ui_classes
+    _ui_status('크롬에서 클래스 목록을 읽는 중...', '#0288D1')
+    try:
+      driver = get_driver()
+    except Exception as e:
+      _ui_status(f'크롬을 열지 못했습니다: {e}', '#D32F2F')
+      return
+    classes = fetch_classes(driver)
+    if not classes and load_login():
+      # 로그인이 풀린 것 같으면 저장해둔 계정으로 한 번 로그인해 본다.
+      _ui_status('로그인이 풀려서 저장된 계정으로 로그인하는 중...', '#0288D1')
+      if auto_login(driver):
+        classes = fetch_classes(driver)
+    if not classes:
+      _ui_status('클래스를 못 읽었습니다. 크롬에서 로그인하거나 [자동 로그인]에 '
+                 '계정을 저장하세요.', '#D32F2F')
+      return
+    _ui_classes = classes
+
+    def fill():
+      lst_class.delete(0, tk.END)
+      for c in _ui_classes:
+        lst_class.insert(tk.END, f"  {c['name']}")
+      lbl_auto_status.config(text='왼쪽에서 클래스를 고르세요.', fg='gray')
+      if not _ui_classes:
+        return
+      # [목록 새로고침]을 눌러도 보던 클래스를 그대로 다시 고른다.
+      # (예전에는 무조건 첫 클래스로 돌아가서, 체크해 둔 세트가 다 사라졌다)
+      pos = 0
+      for i, c in enumerate(_ui_classes):
+        if str(c['idx']) == str(_ui_class_idx):
+          pos = i
+          break
+      lst_class.selection_clear(0, tk.END)
+      lst_class.selection_set(pos)
+      lst_class.see(pos)
+      _ui_pick_class()
+
+    root.after(0, fill)
+
+  threading.Thread(target=work, daemon=True).start()
+
+
+def _ui_pick_class(event=None):
+  """고른 클래스의 세트를 읽어 오른쪽에 펼친다."""
+  global _ui_class_idx
+  sel = lst_class.curselection()
+  if not sel or sel[0] >= len(_ui_classes):
+    return
+  cls = _ui_classes[sel[0]]
+  _ui_class_idx = cls['idx']
+
+  def work():
+    global _ui_sets
+    _ui_status(f"'{cls['name']}'의 세트를 읽는 중...", '#0288D1')
+    try:
+      driver = get_driver()
+    except Exception as e:
+      _ui_status(f'크롬을 열지 못했습니다: {e}', '#D32F2F')
+      return
+    sets = fetch_sets(driver, cls['idx'])
+    if not sets:
+      _ui_status(f"'{cls['name']}'의 세트를 못 읽었습니다. [목록 새로고침]을 눌러보세요.",
+                 '#D32F2F')
+      return
+    _ui_sets = [dict(x, class_idx=cls['idx']) for x in sets]
+    # 진도/테스트는 줄을 만든 뒤 클래스 리포트 한 장으로 채운다.
+    root.after(0, _ui_build_rows)
+
+  threading.Thread(target=work, daemon=True).start()
+
+
+def _ui_build_rows():
+  """세트 한 줄씩 만들어 붙인다(체크 / 이름 / 진도 / 목표).
+
+  모든 세트를 고를 수 있다. 선생님이 지금 진도로 지정한 세트(▶)만 미리
+  체크해 두고, 나머지도 체크만 하면 그대로 학습한다."""
+  global _ui_rows
+  for row in _ui_rows:
+    row['frame'].destroy()
+  _ui_rows = []
+
+  for i, item in enumerate(_ui_sets):
+    bg = '#FFFFFF' if i % 2 == 0 else '#F5F5F5'
+    frame = tk.Frame(frame_sets, bg=bg)
+    frame.pack(fill='x')
+
+    # 아무것도 미리 체크하지 않는다. 지금 진도인 세트는 ▶ 와 초록 글씨로
+    # 알려만 주고, 고르는 건 사용자가 한다.
+    # 다만 [목록 새로고침] 등으로 줄을 다시 그릴 때는, 아까 체크해 둔 것이
+    # 사라지지 않게 그대로 살려준다.
+    now = bool(item.get('current') or item.get('learning'))
+    var = tk.IntVar(value=1 if str(item['idx']) in _ui_checked else 0)
+    kind = '문장' if item['sentence'] else '단어'
+    mark = '▶ ' if now else ''
+    row = {'frame': frame, 'var': var, 'item': item}
+
+    # 오른쪽 끝(목표 %)을 먼저 붙인다. 파이썬 창은 먼저 붙인 것에 자리를
+    # 먼저 주기 때문에, 이름이 길어도 목표 칸이 잘리지 않는다.
+    # 목표는 화살표(위/아래)로만 조절한다. state='readonly'면 값은 그대로
+    # 읽히고 화살표도 동작하는데, 사람이 직접 타자로 고칠 수는 없다.
+    goal_var = tk.StringVar(
+        value=str(_goal_value(_ui_checked.get(str(item['idx']))
+                              or var_goal_all.get())))
+    spin = tk.Spinbox(frame, from_=100, to=1000, increment=100, width=5,
+                      font=('맑은 고딕', 9), justify='center',
+                      textvariable=goal_var, state='readonly',
+                      readonlybackground='white', cursor='hand2')
+    row['goal'] = goal_var
+    tk.Label(frame, text='%까지', bg=bg, font=('맑은 고딕', 9)).pack(
+        side='right', padx=(0, 10))
+    spin.pack(side='right')
+
+    chk = tk.Checkbutton(
+        frame,
+        text=f"{mark}{item['name']}",
+        variable=var,
+        bg=bg,
+        anchor='w',
+        width=30,
+        font=('맑은 고딕', 10, 'bold') if now else ('맑은 고딕', 10),
+        fg='#2E7D32' if now else 'black',
+        command=lambda r=row: _ui_row_toggled(r),
+    )
+    chk.pack(side='left', padx=(6, 0))
+
+    tk.Label(frame, text=f"[{kind}] {item['count']}", bg=bg, fg='#777777',
+             font=('맑은 고딕', 9), width=10, anchor='w').pack(side='left', padx=2)
+
+    # 진도는 암기/리콜/스펠/테스트를 따로따로 칸을 나눠 보여준다.
+    # 한 덩어리 글자로 두면 다 같은 색이라 뭐가 끝났는지 한눈에 안 보였다.
+    # (끝난 것 초록 / 하다 만 것 주황 / 아직 안 한 것 회색)
+    rate_box = tk.Frame(frame, bg=bg)
+    rate_box.pack(side='left', padx=6, fill='x', expand=True)
+    cells = {}
+    for key, width in (('memorize', 9), ('recall', 9), ('spell', 9),
+                       ('test', 16)):
+      cell = tk.Label(rate_box, text='', bg=bg, font=('맑은 고딕', 9),
+                      width=width, anchor='w')
+      cell.pack(side='left')
+      cells[key] = cell
+
+    row['spin'] = spin
+    row['rate'] = cells
+    # 지난번에 읽어둔 진도가 있으면 먼저 연한 글씨로 보여준다(읽는 동안
+    # 빈칸으로 두지 않으려고). 새로 읽으면 제 색으로 바뀐다.
+    old = _rate_cache.get(str(item['idx']))
+    if old:
+      _ui_paint_rates(row, old, dim=True)
+    _ui_rows.append(row)
+
+  lbl_auto_status.config(
+      text=f'세트 {len(_ui_sets)}개. 학습할 세트를 체크하고 목표 퍼센트를 정한 뒤 '
+           '[자동 시작]을 누르세요. (▶ = 지금 진도인 세트)',
+      fg='gray')
+  # 진도/테스트는 체크와 상관없이 모든 세트에 표시한다(리포트 한 장으로).
+  _ui_fit_scroll()
+  _ui_load_report(_ui_class_idx)
+
+
+def _ui_fit_scroll():
+  """스크롤 범위를 내용 크기에 맞춘다."""
+  frame_sets.update_idletasks()
+  canvas_sets.configure(scrollregion=canvas_sets.bbox('all'))
+
+
+# 세트별 진도와 테스트 결과는 클래스 '리포트' 화면 한 장에 다 들어 있다.
+# 그래서 클래스를 고르면 그 한 장만 받아와서(fetch, 화면 이동 없음) 모든 줄을
+# 한 번에 채운다. 세트가 80개여도 1초면 된다.
+#
+# 읽어둔 값은 파일에도 적어둬서, 다음에 켜면 새로 읽기 전에도 지난번 값을
+# 연한 글씨로 먼저 보여준다.
+_RATE_FILE = os.path.join(
+    os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+    'ClasscardMacro', 'rates.json')
+
+
+def _load_rate_cache():
+  try:
+    with open(_RATE_FILE, 'r', encoding='utf-8') as f:
+      data = json.load(f)
+    return data if isinstance(data, dict) else {}
+  except Exception:
+    return {}
+
+
+_rate_cache = _load_rate_cache()
+
+
+def _save_rate_cache():
+  try:
+    os.makedirs(os.path.dirname(_RATE_FILE), exist_ok=True)
+    with open(_RATE_FILE, 'w', encoding='utf-8') as f:
+      json.dump(_rate_cache, f)
+  except Exception:
+    pass
+
+
+def _test_failed(test):
+  """테스트를 보긴 했는데 떨어졌는지. 결과 줄에 'FAIL'이 붙어 있다.
+
+  사이트는 '100점 PASS' / '40점 FAIL'처럼 적어준다. 예전에는 기록만 있으면
+  다 완료(초록)로 쳤는데, 떨어진 것도 다 한 것처럼 보여서 구분한다."""
+  return bool(re.search(r'fail|실패', test or '', re.I))
+
+
+def _test_text(test):
+  """테스트 결과 한 줄. '9/23 18:41 | 100점 PASS' -> '테스트 100점 (9/23)'.
+  떨어졌으면 '테스트 40점 실패 (9/23)'."""
+  test = (test or '').strip()
+  if not test:
+    return '테스트 안 봄'
+  when, _, rest = test.partition('|')
+  day = (when.strip().split() or [''])[0]
+  m = re.search(r'(\d+)\s*점', rest or test)
+  score = f'{m.group(1)}점' if m else ''
+  tail = f' ({day})' if day else ''
+  if _test_failed(test):
+    return f'테스트 {score} 실패'.replace('  ', ' ') + tail
+  if score:
+    return f'테스트 {score}' + tail
+  return '테스트 완료'
+
+
+_RATE_DONE = '#2E7D32'    # 다 한 것(초록)
+_RATE_PART = '#E65100'    # 하다 만 것(주황)
+_RATE_NONE = '#9E9E9E'    # 아직 안 한 것(회색)
+_RATE_DIM = '#C8C8C8'     # 지난번에 읽어둔 값(더 연하게)
+
+
+def _rate_color(value, dim=False):
+  if dim:
+    return _RATE_DIM
+  if not value:
+    return _RATE_NONE
+  return _RATE_DONE if value >= 100 else _RATE_PART
+
+
+def _ui_paint_rates(row, rates, dim=False):
+  """한 줄의 암기/리콜/스펠/테스트 칸을 상태에 맞는 색으로 칠한다."""
+  cells = row.get('rate')
+  if not isinstance(cells, dict):
+    return
+  rates = rates or {}
+  try:
+    for key, name in (('memorize', '암기'), ('recall', '리콜'), ('spell', '스펠')):
+      v = rates.get(key)
+      cells[key].config(text=f'{name} {_pct(v)}', fg=_rate_color(v, dim))
+    test = rates.get('test')
+    if dim:
+      test_color = _RATE_DIM
+    elif not test:
+      test_color = _RATE_NONE
+    elif _test_failed(test):
+      test_color = _RATE_PART   # 봤지만 떨어짐 = 아직 다 한 게 아니다
+    else:
+      test_color = _RATE_DONE
+    cells['test'].config(text=_test_text(test), fg=test_color)
+  except Exception:
+    pass
+
+
+def _ui_paint_message(row, text, color=_RATE_NONE):
+  """진도 자리에 안내 글자 한 줄만 보여준다(예: '진도를 못 읽음')."""
+  cells = row.get('rate')
+  if not isinstance(cells, dict):
+    return
+  try:
+    for key in ('memorize', 'recall', 'spell', 'test'):
+      cells[key].config(text='')
+    cells['memorize'].config(text=text, fg=color)
+  except Exception:
+    pass
+
+
+def _ui_row_toggled(row):
+  """세트 줄의 체크를 눌렀을 때. 고른 개수만 알려준다(진도는 항상 표시)."""
+  cnt = sum(1 for r in _ui_rows if r['var'].get())
+  lbl_auto_status.config(text=f'세트 {cnt}개를 골랐습니다.', fg='gray')
+
+
+def _ui_load_report(class_idx):
+  """클래스 리포트를 읽어 모든 줄의 진도/테스트를 채운다."""
+
+  def work():
+    if auto_running or is_running:
+      return  # 자동 학습이 크롬을 쓰는 중이면 건드리지 않는다
+    try:
+      driver = get_driver()
+    except Exception:
+      return
+    # fetch는 클래스카드 페이지 안에서만 된다.
+    try:
+      if 'classcard.net' not in (driver.current_url or ''):
+        _open_site(driver, '/Main/user')
+    except Exception:
+      pass
+    data = fetch_class_report(driver, class_idx)
+    if _ui_class_idx != class_idx:
+      return  # 그새 다른 클래스를 골랐다
+    if not data:
+      root.after(0, lambda: lbl_auto_status.config(
+          text='진도를 못 읽었습니다. [목록 새로고침]을 눌러보세요.', fg='#D32F2F'))
+      return
+    for item in _ui_sets:
+      got = data.get(str(item['idx'])) or {}
+      # 리포트에 없는 세트 = 아직 한 번도 안 한 세트.
+      rates = {m: (got.get(m) or 0) for m in ('memorize', 'recall', 'spell')}
+      rates['test'] = got.get('test') or ''
+      item['rates'] = rates
+      _rate_cache[str(item['idx'])] = rates
+      root.after(0, lambda it=item: _ui_set_rate_text(it, it['rates']))
+    _save_rate_cache()
+    root.after(0, _ui_rate_progress)
+
+  threading.Thread(target=work, daemon=True).start()
+
+
+def _ui_rate_progress():
+  cnt = sum(1 for r in _ui_rows if r['var'].get())
+  try:
+    lbl_auto_status.config(
+        text=f'진도를 다 읽었습니다. 고른 세트 {cnt}개 — '
+             '목표 퍼센트를 정하고 [자동 시작]을 누르세요.', fg='gray')
+  except Exception:
+    pass
+
+
+def _pct(value):
+  return f'{value}%' if value is not None else '-'
+
+
+def _ui_set_rate_by_idx(set_idx, rates):
+  """세트 번호로 줄을 찾아 진도를 새로 쓴다(자동 학습이 도는 중에 쓴다)."""
+  for row in _ui_rows:
+    if str(row['item']['idx']) != str(set_idx):
+      continue
+    merged = dict(row['item'].get('rates') or {})
+    merged.update(rates)
+    row['item']['rates'] = merged
+    _rate_cache[str(set_idx)] = merged
+    _ui_paint_rates(row, merged)
+    return
+
+
+def _ui_set_rate_text(item, rates):
+  """그 세트 줄의 진도 칸을 칠한다. rates가 글자면 안내 문구로 본다."""
+  for row in _ui_rows:
+    if row['item'] is item:
+      if isinstance(rates, str):
+        _ui_paint_message(row, rates, '#D32F2F')
+      else:
+        _ui_paint_rates(row, rates)
+      return
+
+
+def _ui_check_all(on=True):
+  # 체크와 진도 표시는 따로다. 체크를 풀어도 진도는 그대로 둔다.
+  for row in _ui_rows:
+    row['var'].set(1 if on else 0)
+  cnt = sum(1 for r in _ui_rows if r['var'].get())
+  lbl_auto_status.config(text=f'세트 {cnt}개를 골랐습니다.', fg='gray')
+
+
+def _ui_apply_goal():
+  """위쪽에 적은 목표를 모든 줄에 한 번에 넣는다(최소 100, 100 단위)."""
+  value = _goal_value(var_goal_all.get())
+  var_goal_all.set(str(value))
+  for row in _ui_rows:
+    row['goal'].set(str(value))
+
+
+def _ui_start():
+  """체크한 세트로 자동 학습을 시작한다."""
+  if auto_running or is_running:
+    messagebox.showinfo('자동 학습', '이미 진행 중입니다. 먼저 [정지]를 누르세요.')
+    return
+  chosen = _ui_collect_checked()
+  if not chosen:
+    messagebox.showwarning('자동 학습', '학습할 세트를 체크하세요.')
+    return
+  _ui_checked.clear()
+  _ui_checked.update(chosen)
+
+  # 어떤 세트를 할지는 여기서 못 박지 않는다. 학습이 도는 동안에도 화면의
+  # 체크를 그때그때 보기 때문에, 하는 중에 세트를 더 체크하면 이어서 한다.
+  plan = {
+      'class_idx': _ui_class_idx,
+      'targets': {},
+      'test': True,
+  }
+  btn_auto_start.config(state=tk.DISABLED)
+  btn_auto_stop.config(state=tk.NORMAL)
+  lst_class.config(state=tk.DISABLED)
+
+  def work():
+    try:
+      auto_worker(plan)
+    finally:
+      root.after(0, lambda: (btn_auto_start.config(state=tk.NORMAL),
+                             btn_auto_stop.config(state=tk.DISABLED),
+                             lst_class.config(state=tk.NORMAL)))
+
+  threading.Thread(target=work, daemon=True).start()
+
+
+def _ui_stop():
+  stop_auto()
+  stop_macro()
+  _ui_status('정지했습니다.', '#D32F2F')
+
+
+def open_manual_window():
+  """예전 수동 조작 화면을 연다."""
+  manual_win.deiconify()
+  manual_win.lift()
+
+
 def restart_program():
   """프로그램만 다시 시작한다. 크롬 창은 그대로 둔다(로그인 유지).
 
@@ -2626,21 +4931,125 @@ def stop_macro(event=None):
 
 
 # --- UI 구성 ---
+#
+# 켜면 바로 보이는 화면: 왼쪽에 내 클래스, 오른쪽에 그 클래스의 세트 목록.
+# 세트마다 목표 퍼센트를 정하고 [자동 시작]을 누르면 끝이다.
+# 예전처럼 직접 모드를 고르고 싶으면 오른쪽 위 [수동 모드].
 root = tk.Tk()
 root.title('클래스카드 매크로')
-root.geometry('480x520')
+root.geometry('1120x660')
+# 세트 줄에 이름·진도·목표%가 한 줄에 들어가야 해서 너무 좁아지면 안 된다.
+root.minsize(900, 480)
 root.resizable(True, True)
 root.wm_attributes('-topmost', True)
-
 root.bind('<Escape>', stop_macro)
 
+# ── 위쪽 띠 ────────────────────────────────────────────────
+frame_head = tk.Frame(root)
+frame_head.pack(fill='x', padx=14, pady=(12, 6))
+
+tk.Label(frame_head, text='클래스카드 매크로', font=('맑은 고딕', 14, 'bold'),
+         fg='#2E7D32').pack(side='left')
+
+btn_restart = tk.Button(frame_head, text='재시작', font=('맑은 고딕', 9),
+                        fg='#555555', command=lambda: restart_program())
+btn_restart.pack(side='right', padx=(6, 0))
+
+tk.Button(frame_head, text='수동 모드', font=('맑은 고딕', 9),
+          command=lambda: open_manual_window()).pack(side='right', padx=6)
+
+tk.Button(frame_head, text='목록 새로고침', font=('맑은 고딕', 9),
+          command=lambda: _ui_load_classes()).pack(side='right', padx=(0, 6))
+
+tk.Button(frame_head, text='자동 로그인', font=('맑은 고딕', 9),
+          command=lambda: open_login_settings()).pack(side='right')
+
+# ── 가운데: 클래스 목록 + 세트 목록 ────────────────────────
+frame_body = tk.Frame(root)
+frame_body.pack(fill='both', expand=True, padx=14)
+
+frame_left = tk.LabelFrame(frame_body, text=' 내 클래스 ',
+                           font=('맑은 고딕', 10, 'bold'))
+frame_left.pack(side='left', fill='y')
+lst_class = tk.Listbox(frame_left, width=22, font=('맑은 고딕', 10),
+                       activestyle='none', exportselection=False,
+                       selectbackground='#2E7D32', selectforeground='white')
+lst_class.pack(fill='both', expand=True, padx=8, pady=8)
+lst_class.bind('<<ListboxSelect>>', lambda e: _ui_pick_class())
+
+frame_right = tk.LabelFrame(frame_body, text=' 학습할 세트 (▶ 지금 진도) ',
+                            font=('맑은 고딕', 10, 'bold'))
+frame_right.pack(side='left', fill='both', expand=True, padx=(10, 0))
+
+frame_tools = tk.Frame(frame_right)
+frame_tools.pack(fill='x', padx=8, pady=(8, 4))
+tk.Button(frame_tools, text='모두 선택', font=('맑은 고딕', 9),
+          command=lambda: _ui_check_all(True)).pack(side='left')
+tk.Button(frame_tools, text='모두 해제', font=('맑은 고딕', 9),
+          command=lambda: _ui_check_all(False)).pack(side='left', padx=6)
+
+tk.Button(frame_tools, text='모두 적용', font=('맑은 고딕', 9),
+          command=lambda: _ui_apply_goal()).pack(side='right', padx=(6, 18))
+tk.Label(frame_tools, text='%', font=('맑은 고딕', 9)).pack(side='right')
+var_goal_all = tk.StringVar(value='100')
+tk.Spinbox(frame_tools, from_=100, to=1000, increment=100, width=5,
+           textvariable=var_goal_all, font=('맑은 고딕', 9),
+           justify='center', state='readonly', readonlybackground='white',
+           cursor='hand2').pack(side='right')
+tk.Label(frame_tools, text='목표 한 번에', font=('맑은 고딕', 9)).pack(
+    side='right', padx=(0, 4))
+
+# 세트 줄이 많아도 스크롤되게 캔버스 위에 올린다.
+frame_scroll = tk.Frame(frame_right)
+frame_scroll.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+canvas_sets = tk.Canvas(frame_scroll, highlightthickness=0, bg='#FFFFFF')
+scroll_sets = tk.Scrollbar(frame_scroll, orient='vertical',
+                           command=canvas_sets.yview)
+canvas_sets.configure(yscrollcommand=scroll_sets.set)
+scroll_sets.pack(side='right', fill='y')
+canvas_sets.pack(side='left', fill='both', expand=True)
+frame_sets = tk.Frame(canvas_sets, bg='#FFFFFF')
+_sets_window = canvas_sets.create_window((0, 0), window=frame_sets, anchor='nw')
+canvas_sets.bind(
+    '<Configure>',
+    lambda e: canvas_sets.itemconfig(_sets_window, width=e.width))
+frame_sets.bind('<Configure>', lambda e: _ui_fit_scroll())
+canvas_sets.bind_all(
+    '<MouseWheel>',
+    lambda e: canvas_sets.yview_scroll(-1 if e.delta > 0 else 1, 'units'))
+
+# ── 아래쪽: 상태 + 시작/정지 ───────────────────────────────
+lbl_auto_status = tk.Label(root, text='크롬에서 클래스 목록을 읽는 중...',
+                           font=('맑은 고딕', 9), fg='gray', wraplength=900,
+                           justify='center')
+lbl_auto_status.pack(pady=(6, 2))
+
+frame_run = tk.Frame(root)
+frame_run.pack(pady=(0, 12))
+btn_auto_start = tk.Button(frame_run, text='자동 시작', width=16, pady=4,
+                           font=('맑은 고딕', 11, 'bold'), fg='white',
+                           bg='#2E7D32', activebackground='#2E7D32',
+                           activeforeground='white',
+                           command=lambda: _ui_start())
+btn_auto_start.pack(side='left', padx=6)
+btn_auto_stop = tk.Button(frame_run, text='정지', width=10, pady=4,
+                          font=('맑은 고딕', 11, 'bold'), fg='#C62828',
+                          command=lambda: _ui_stop(), state=tk.DISABLED)
+btn_auto_stop.pack(side='left', padx=6)
+
+# ── 수동 모드 창(예전 화면) ────────────────────────────────
+manual_win = tk.Toplevel(root)
+manual_win.title('수동 모드')
+manual_win.geometry('480x540')
+manual_win.withdraw()
+manual_win.protocol('WM_DELETE_WINDOW', manual_win.withdraw)
+manual_win.bind('<Escape>', stop_macro)
+
 # 단어 단어장 / 문장 단어장 전환 (왼쪽 위)
-# 처음엔 아무것도 안 골라진 상태다. 예전엔 [단어]가 미리 켜져 있어서 문장
-# 단어장인데 그대로 돌리는 등 헷갈렸다. 하나를 고르기 전에는 다른 버튼을
-# 전부 막아둔다(on_kind_change).
+# 하나를 고르기 전에는 다른 버튼을 전부 막아둔다(on_kind_change).
 study_kind = tk.StringVar(value='')
 kind_buttons = {}
-frame_kind = tk.Frame(root)
+frame_kind = tk.Frame(manual_win)
 if SENTENCE_MODE_ENABLED:
   frame_kind.pack(anchor='w', padx=15, pady=(10, 0))
 for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
@@ -2661,43 +5070,31 @@ for _kind_text, _kind_value in (('단어', 'word'), ('문장', 'sentence')):
   _btn.pack(side='left', padx=(0, 6))
   kind_buttons[_kind_value] = _btn
 
-# 오른쪽 위 재시작 버튼. 다른 위젯 배치에 영향을 안 주도록 place로 띄운다.
-btn_restart = tk.Button(
-    root,
-    text='재시작',
-    font=('맑은 고딕', 8),
-    fg='#555555',
-    command=restart_program,
-)
-btn_restart.place(relx=1.0, x=-10, y=8, anchor='ne')
-
 lbl_status = tk.Label(
-    root,
-    text='1. 북마크 추출 -> 2. [불러오기] -> 모드 선택',
+    manual_win,
+    text='크롬에서 세트를 연 뒤 [단어 불러오기]',
     font=('맑은 고딕', 9),
     fg='gray',
     wraplength=460,
     justify='center',
 )
-# 오른쪽 위 재시작 버튼과 겹치지 않도록 그 아래에서 시작한다.
-lbl_status.pack(pady=(36, 10))
+lbl_status.pack(pady=(16, 10))
 
-# 공통 불러오기 버튼
-frame_top = tk.Frame(root)
+frame_top = tk.Frame(manual_win)
 frame_top.pack(pady=5)
 btn_load = tk.Button(
     frame_top,
-    text='클립보드 불러오기',
+    text='단어 불러오기',
     width=30,
     font=('맑은 고딕', 10, 'bold'),
     fg='#0288D1',
-    command=load_from_clipboard,
+    command=load_words,
 )
 btn_load.pack()
 
 # 암기 모드 컨트롤 프레임
 frame_memo = tk.LabelFrame(
-    root, text=' 암기 ', font=('맑은 고딕', 9, 'bold')
+    manual_win, text=' 암기 ', font=('맑은 고딕', 9, 'bold')
 )
 frame_memo.pack(pady=8, padx=15, fill='x')
 
@@ -2716,7 +5113,6 @@ btn_start = tk.Button(
 btn_start.pack(side='left', padx=(0, 6))
 
 # 암기 화면에 들어간 뒤 사이트에서 학습을 시작하고 누르는 버튼.
-# 매크로가 그 화면을 기다리는 동안에만 켜진다.
 btn_memo_go = tk.Button(
     frame_memo_row,
     text='시작',
@@ -2728,9 +5124,8 @@ btn_memo_go = tk.Button(
 )
 btn_memo_go.pack(side='left')
 
-# 리콜 학습 모드 컨트롤 프레임
 frame_recall = tk.LabelFrame(
-    root, text=' 리콜 ', font=('맑은 고딕', 9, 'bold')
+    manual_win, text=' 리콜 ', font=('맑은 고딕', 9, 'bold')
 )
 frame_recall.pack(pady=8, padx=15, fill='x')
 
@@ -2745,9 +5140,8 @@ btn_recall_start = tk.Button(
 )
 btn_recall_start.pack(padx=12, pady=8)
 
-# 스펠(뜻 입력) 학습 모드 컨트롤 프레임
 frame_spell = tk.LabelFrame(
-    root, text=' 스펠 ', font=('맑은 고딕', 9, 'bold')
+    manual_win, text=' 스펠 ', font=('맑은 고딕', 9, 'bold')
 )
 frame_spell.pack(pady=8, padx=15, fill='x')
 
@@ -2762,9 +5156,8 @@ btn_spell_start = tk.Button(
 )
 btn_spell_start.pack(padx=12, pady=8)
 
-# 테스트(최종 시험) 학습 모드 컨트롤 프레임
 frame_test = tk.LabelFrame(
-    root, text=' 테스트 ', font=('맑은 고딕', 9, 'bold')
+    manual_win, text=' 테스트 ', font=('맑은 고딕', 9, 'bold')
 )
 frame_test.pack(pady=8, padx=15, fill='x')
 
@@ -2779,9 +5172,8 @@ btn_test_start = tk.Button(
 )
 btn_test_start.pack(padx=12, pady=8)
 
-# 어느 모드에서든 공통으로 쓰는 정지 버튼 (카테고리 없이 맨 아래 중앙)
 btn_stop = tk.Button(
-    root,
+    manual_win,
     text='정지',
     width=10,
     font=('맑은 고딕', 10, 'bold'),
@@ -2794,5 +5186,10 @@ btn_stop.pack(pady=(4, 12))
 if not SENTENCE_MODE_ENABLED:
   study_kind.set('word')
 on_kind_change()
+
+# 켜자마자 클래스 목록을 읽어온다.
+root.after(300, _ui_load_classes)
+# 체크 상태를 계속 지켜본다(학습 중에 체크해도 이어서 하도록).
+root.after(1000, _ui_sync_checked)
 
 root.mainloop()
