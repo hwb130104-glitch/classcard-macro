@@ -1,6 +1,6 @@
 ﻿[Setup]
 AppName=클래스카드 매크로
-AppVersion=2.0.0
+AppVersion=2.0.1
 DefaultDirName={autopf}\ClasscardMacro
 DefaultGroupName=클래스카드 매크로
 OutputDir=.
@@ -16,7 +16,7 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Files]
 ; 매크로 메인 프로그램 (암기.exe)
-Source: "암기.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist/main.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; 바탕화면에 바로가기 생성
